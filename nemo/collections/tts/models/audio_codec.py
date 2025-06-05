@@ -279,6 +279,7 @@ class AudioCodecModel(ModelPT):
             Decoded output `audio` in the time domain and its length in number of samples `audio_len`.
             Note that `audio_len` will be a multiple of `self.samples_per_frame`.
         """
+        inputs = inputs.to(self.dtype)
         audio, audio_len = self.audio_decoder(inputs=inputs, input_len=input_len)
         return audio, audio_len
 
