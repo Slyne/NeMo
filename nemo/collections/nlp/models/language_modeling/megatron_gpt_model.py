@@ -83,7 +83,7 @@ try:
     from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
     from megatron.core.datasets.utils import get_blend_from_list
     from megatron.core.dist_checkpointing.dict_utils import dict_list_map_inplace
-    from megatron.core.dist_checkpointing.mapping import LocalNonpersitentObject, ShardedObject
+    from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedObject
     from megatron.core.distributed import DistributedDataParallel as McoreDDP
     from megatron.core.distributed import DistributedDataParallelConfig, finalize_model_grads
 
@@ -163,6 +163,10 @@ def get_specs(spec_name, transformer_config=None, use_te=True, hyena_cfg: Dict =
 
     if use_te and spec_name == '':
         spec_name = 'te_gpt'
+    from megatron.core.models.gpt.gpt_layer_specs import (
+        get_gpt_layer_local_spec,
+        get_gpt_layer_with_transformer_engine_spec,
+    )
     name_spec_dict = {
         "": get_gpt_layer_local_spec(num_experts, moe_grouped_gemm),
         "te_gpt": get_gpt_layer_with_transformer_engine_spec(num_experts, moe_grouped_gemm),
@@ -1938,7 +1942,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             # WAR: This is a temporary fix to skip loading FP8 parameters for Dot Product Attention
             def skip_fp8_load(x):
                 if isinstance(x, ShardedObject) and 'fused_attention' in x.key and '_extra_state' in x.key:
-                    x = LocalNonpersitentObject(x.data)  # use the FP8 state from initialization, not from ckpt
+                    x = LocalNonpersistentObject(x.data)  # use the FP8 state from initialization, not from ckpt
                 return x
 
             if self.cfg.get('skip_fp8_attention_checkpoint_load', True):

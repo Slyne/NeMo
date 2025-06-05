@@ -696,7 +696,7 @@ class Conv1dNorm(NeuralModule):
     def input_types(self):
         return {
             "inputs": NeuralType(('B', 'C', 'T'), VoidType()),
-            "input_len": NeuralType(tuple('B'), LengthsType()),
+            "input_len": NeuralType(tuple('B', ), LengthsType()),
         }
 
     @property
@@ -1293,7 +1293,7 @@ class FiniteScalarQuantizer(VectorQuantizerBase):
 
     def nonnegative_to_codes(self, codes_nonnegative: torch.Tensor) -> torch.Tensor:
         """Convert nonnegative values to values centered arouund zero."""
-        scale = offset = self.num_levels // 2
+        scale = offset = self.num_levels.to(codes_nonnegative.device) // 2
         return (codes_nonnegative - offset) / scale
 
     def codes_to_indices(self, codes: torch.Tensor) -> torch.Tensor:
@@ -1362,7 +1362,7 @@ class FiniteScalarQuantizer(VectorQuantizerBase):
 
         indices = rearrange(indices, 'D B T -> B D T')
         # convert a single index to nonnegative index per-dimension
-        codes_nonnegative = (indices // self.dim_base_index) % self.num_levels
+        codes_nonnegative = (indices // self.dim_base_index.to(indices.device)) % self.num_levels.to(indices.device)
         # convert nonnegative codes to codes (centered around zero)
         dequantized = self.nonnegative_to_codes(codes_nonnegative)
 
