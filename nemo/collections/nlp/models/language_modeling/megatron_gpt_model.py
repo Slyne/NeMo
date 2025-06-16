@@ -163,6 +163,11 @@ def get_specs(spec_name, transformer_config=None, use_te=True, hyena_cfg: Dict =
 
     if use_te and spec_name == '':
         spec_name = 'te_gpt'
+
+    from megatron.core.models.gpt.gpt_layer_specs import (
+            get_gpt_layer_local_spec,
+            get_gpt_layer_with_transformer_engine_spec
+    )
     name_spec_dict = {
         "": get_gpt_layer_local_spec(num_experts, moe_grouped_gemm),
         "te_gpt": get_gpt_layer_with_transformer_engine_spec(num_experts, moe_grouped_gemm),

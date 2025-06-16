@@ -1280,7 +1280,7 @@ class FiniteScalarQuantizer(VectorQuantizerBase):
 
     def nonnegative_to_codes(self, codes_nonnegative: torch.Tensor) -> torch.Tensor:
         """Convert nonnegative values to values centered arouund zero."""
-        scale = offset = self.num_levels // 2
+        scale = offset = self.num_levels.to(codes_nonnegative.device) // 2
         return (codes_nonnegative - offset) / scale
 
     def codes_to_indices(self, codes: torch.Tensor) -> torch.Tensor:
@@ -1289,8 +1289,8 @@ class FiniteScalarQuantizer(VectorQuantizerBase):
             raise RuntimeError(
                 f'Input code dimension {codes.size(1)} not matching the expected dimension {self.dim}, input codes shape {codes.shape}'
             )
+        codes_nonnegative = (indices // self.dim_base_index.to(indices.device)) % self.num_levels.to(indices.device)
         # convert code vectors to nonnegative values
-        indices = self.codes_to_nonnegative(codes)
         # convert one nonnegative index per dimension to a single index per code vector
         indices = torch.sum(indices * self.dim_base_index, dim=1)
         return indices.to(torch.int32)
@@ -1321,7 +1321,7 @@ class FiniteScalarQuantizer(VectorQuantizerBase):
     @typecheck(
         input_types={
             "inputs": NeuralType(('B', 'D', 'T'), EncodedRepresentation()),
-            "input_len": NeuralType(tuple('B'), LengthsType(), optional=True),
+            "input_len": NeuralType(tuple('B',), LengthsType(), optional=True),
         },
         output_types={"indices": NeuralType(('D', 'B', 'T'), Index())},
     )
