@@ -1289,8 +1289,8 @@ class FiniteScalarQuantizer(VectorQuantizerBase):
             raise RuntimeError(
                 f'Input code dimension {codes.size(1)} not matching the expected dimension {self.dim}, input codes shape {codes.shape}'
             )
-        codes_nonnegative = (indices // self.dim_base_index.to(indices.device)) % self.num_levels.to(indices.device)
         # convert code vectors to nonnegative values
+        indices = self.codes_to_nonnegative(codes)
         # convert one nonnegative index per dimension to a single index per code vector
         indices = torch.sum(indices * self.dim_base_index, dim=1)
         return indices.to(torch.int32)
@@ -1349,7 +1349,7 @@ class FiniteScalarQuantizer(VectorQuantizerBase):
 
         indices = rearrange(indices, 'D B T -> B D T')
         # convert a single index to nonnegative index per-dimension
-        codes_nonnegative = (indices // self.dim_base_index) % self.num_levels
+        codes_nonnegative = (indices // self.dim_base_index.to(indices.device)) % self.num_levels.to(indices.device)
         # convert nonnegative codes to codes (centered around zero)
         dequantized = self.nonnegative_to_codes(codes_nonnegative)
 
