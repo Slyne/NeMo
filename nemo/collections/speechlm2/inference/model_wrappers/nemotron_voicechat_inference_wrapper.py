@@ -831,6 +831,53 @@ class NemotronVoicechatInferenceWrapper:
         current_buffer = audio_buffer if buffer_fill_level == buffer_size_samples else audio_buffer[:, :buffer_fill_level]
         return audio_buffer, buffer_fill_level, current_buffer
 
+    def _do_fc_prefill(self, response_token_ids,
+                       dynamic_cache, effective_request_id,
+                       input_embeds_history):
+        """Perform a pure LLM prefill to inject the backend agent response.
+
+        Builds embeddings for [SPECIAL_15, response..., SPECIAL_16]
+        and feeds them into the LLM as a prefill (no decode). Follows the same
+        pattern as system-prompt prefill in inference_realtime_streaming.
+
+        Args:
+            response_token_ids: List of token IDs [SPECIAL_15, resp_0, ..., resp_N-1, SPECIAL_16].
+            dynamic_cache: Current KV cache (DynamicCache or None for vLLM).
+            effective_request_id: Request ID for vLLM.
+            input_embeds_history: List of past input embeddings (no-cache mode only).
+
+        Returns:
+            updated_cache (or None for no-cache / vLLM modes)
+        """
+        pad_id = self.model.stt_model.text_pad_id
+        num_positions = len(response_token_ids)
+
+        token_ids = torch.tensor([response_token_ids], device=self.device, dtype=torch.long)
+        pad_tensor = torch.tensor([[pad_id]], device=self.device, dtype=torch.long)
+
+        text_emb = self.model.stt_model.embed_tokens(token_ids).to(dtype=self.dtype)
+        pad_asr_emb = self.model.stt_model.embed_asr_tokens(pad_tensor).to(dtype=self.dtype)
+        prefill_embeds = text_emb + pad_asr_emb
+
+        if self.use_vllm_llm:
+            with torch.no_grad():
+                for t in range(num_positions):
+                    self.model_llm_interface(
+                        prefill_embeds[:, t:t+1, :],
+                        request_id=effective_request_id,
+                    )
+            logging.info(f"[FC prefill] vLLM step-by-step prefilled {num_positions} tokens.")
+            return None
+        elif dynamic_cache is not None:
+            with torch.no_grad():
+                ans = self.model.stt_model(prefill_embeds, cache=dynamic_cache)
+            logging.info(f"[FC prefill] Prefilled {num_positions} tokens via PyTorch path.")
+            return ans.get("cache", dynamic_cache)
+        else:
+            input_embeds_history.append(prefill_embeds)
+            logging.info(f"[FC prefill] No-cache mode: appended {num_positions} embeddings to history.")
+            return None
+
     def infer_one_step(self,
                        audio_input,
                        num_frames_per_chunk,
@@ -849,7 +896,24 @@ class NemotronVoicechatInferenceWrapper:
                        has_prompt: bool = False,
                        codec_cache=None):
 
-        # Set up effective request ID for vLLM streaming
+        # One-time init of special token IDs
+        if not hasattr(self, '_agent_special_tokens_initialized'):
+            self.tokenizer.special_13_id = self.tokenizer.text_to_ids('<SPECIAL_13>')[0]
+            self.tokenizer.special_14_id = self.tokenizer.text_to_ids('<SPECIAL_14>')[0]
+            self.tokenizer.special_15_id = self.tokenizer.text_to_ids('<SPECIAL_15>')[0]
+            self.tokenizer.special_12_id = self.tokenizer.text_to_ids('<SPECIAL_12>')[0]
+            self._agent_special_tokens_initialized = True
+            self._agent_request_id = None
+
+        # Create a new agent handler for each new request_id
+        effective_req = request_id or self.request_id
+        if not hasattr(self, 'agent_handler') or effective_req != self._agent_request_id:
+            from nemo.collections.speechlm2.inference.model_wrappers.agent_handler import BackendAgentHandler
+            self.agent_handler = BackendAgentHandler(self.tokenizer, session_id=effective_req)
+            self.special_13_occurrence_count = 0
+            self._agent_request_id = effective_req
+            logging.info(f"Created new BackendAgentHandler for request_id={effective_req}")
+
         effective_request_id = request_id or self.request_id
 
         start_time_one_step = time.time()
@@ -900,7 +964,7 @@ class NemotronVoicechatInferenceWrapper:
             # e.g.
             # (1) if we pass in just one 80ms chunk -> the model treats it as 10ms, then 70ms with 10ms silence padding at the end.
             # (2) if we pass 80ms, 80ms -> the model treats it as 10ms, 80ms, 70ms with 10ms silence padding at the end.
-            # => we do not want to use the final embedding due to containing silence padding. We want to use the second-to-last embedding.
+            # => we do not want to use the final embedding due to g containing silence padding. We want to use the second-to-last embedding.
             embedding_position = -2
             newest_frame_index = total_encoded_frames + embedding_position
             base_frame_index = newest_frame_index - (num_frames_per_chunk - 1)
@@ -948,7 +1012,7 @@ class NemotronVoicechatInferenceWrapper:
                     current_input_emb += last_fc_token_emb.to(dtype=self.dtype)
 
             start_stt_model = time.time()
-
+           
             if use_cache or self.use_vllm_llm:
                 if self.use_vllm_llm:
                     # vLLM requires request_id
@@ -982,6 +1046,34 @@ class NemotronVoicechatInferenceWrapper:
 
             predicted_token = ans["predicted_token"]
             asr_predicted_token = ans["asr_predicted_token"]
+
+            # --- FC detection and prefill ---
+            if hasattr(self, 'agent_handler'):
+                pred_id = predicted_token.item() if torch.is_tensor(predicted_token) else predicted_token
+
+                if pred_id == self.tokenizer.special_13_id:
+                    self.special_13_occurrence_count += 1
+                    if not self.agent_handler._request_sent:
+                        logging.info("SPECIAL_13 detected — calling backend agent service (async)...")
+                        self.agent_handler.on_special_13_detected(gen_text, gen_asr_text, current_frame_idx)
+
+                if self.agent_handler._request_sent and self.agent_handler.response_ready:
+                    response_tokens = self.agent_handler.get_all_response_token_ids()
+                    if response_tokens:
+                        logging.info(f"Backend response ready ({len(response_tokens)} tokens) — performing FC prefill at frame {current_frame_idx}")
+                        updated_cache = self._do_fc_prefill(
+                            response_tokens,
+                            dynamic_cache, effective_request_id,
+                            input_embeds_history,
+                        )
+                        if updated_cache is not None:
+                            dynamic_cache = updated_cache
+                        self.special_13_occurrence_count = 0
+                        self.agent_handler.reset()
+
+                if self.special_13_occurrence_count > 0 and pred_id == self.tokenizer.special_15_id:
+                    logging.info(f"SPECIAL_15 detected — replacing with pad_id at frame {current_frame_idx}")
+                    predicted_token = self.tokenizer.pad_id
 
             gen_text[:, current_frame_idx] = predicted_token
             predicted_tokens[:, frame_offset] = predicted_token
@@ -1466,6 +1558,17 @@ class NemotronVoicechatInferenceWrapper:
 
         # frame_idx corresponds to index of the first frame passed to infer_one_step
         # (we need this distinction in the case that num_frames_per_chunk > 1)
+        
+        #### Slyne ####
+        from nemo.collections.speechlm2.inference.model_wrappers.agent_handler import BackendAgentHandler
+        self.agent_handler = BackendAgentHandler(
+            self.tokenizer,
+            session_id=stream_request_id,
+        )
+        self.special_13_occurrence_count = 0
+        self.tokenizer.special_13_id = self.tokenizer.text_to_ids('<SPECIAL_13>')[0]
+        #### Slyne ####
+        
         frame_idx = 0
         while frame_idx < total_frames:
             slice_start = frame_idx * FRAME_SIZE_SAMPLES
@@ -1495,7 +1598,7 @@ class NemotronVoicechatInferenceWrapper:
                 has_prompt=(prompt_len > 0),
                 codec_cache=codec_cache,
             )
-
+            
             # handle results from infer_one_step
             if has_function_head and 'function_predicted_text_tokens' in result:
                 for fi in range(num_frames_per_chunk):
