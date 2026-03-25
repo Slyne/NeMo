@@ -1086,8 +1086,10 @@ class NemotronVoicechatInferenceWrapper:
                 if gen_function_text is not None:
                     gen_function_text[:, current_frame_idx] = ans["function_predicted_token"]
 
-            # Apply forced turn taking based on ASR results
-            self._maybe_apply_forced_turn_taking(current_frame_idx, gen_text, gen_asr_text)
+            # Skip forced turn taking while a function call is in flight
+            fc_in_flight = hasattr(self, 'agent_handler') and self.agent_handler._request_sent and not self.agent_handler.is_done
+            if not fc_in_flight:
+                self._maybe_apply_forced_turn_taking(current_frame_idx, gen_text, gen_asr_text)
             # Update predicted_tokens with any changes made by forced turn taking
             predicted_tokens[:, frame_offset] = gen_text[:, current_frame_idx]
 
