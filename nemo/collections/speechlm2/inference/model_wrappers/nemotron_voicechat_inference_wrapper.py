@@ -1051,7 +1051,7 @@ class NemotronVoicechatInferenceWrapper:
             if hasattr(self, 'agent_handler'):
                 pred_id = predicted_token.item() if torch.is_tensor(predicted_token) else predicted_token
 
-                if pred_id == self.tokenizer.special_13_id:
+                if pred_id == self.tokenizer.special_13_id or pred_id == self.tokenizer.special_14_id:
                     self.special_13_occurrence_count += 1
                     if not self.agent_handler._request_sent:
                         logging.info("SPECIAL_13 detected — calling backend agent service (async)...")
@@ -1071,8 +1071,15 @@ class NemotronVoicechatInferenceWrapper:
                         self.special_13_occurrence_count = 0
                         self.agent_handler.reset()
 
+                # to avoid agent emit special_15 token
+                # special_15 should only be emitted by backend agent service
                 if self.special_13_occurrence_count > 0 and pred_id == self.tokenizer.special_15_id:
                     logging.info(f"SPECIAL_15 detected — replacing with pad_id at frame {current_frame_idx}")
+                    predicted_token = self.tokenizer.pad_id
+                
+                # to avoid agent emit eos token immediately after agent response text
+                if pred_id == self.tokenizer.eos_id and gen_text[:, current_frame_idx - 1] != self.tokenizer.pad_id:
+                    logging.info(f"EOS detected — replacing with pad_id at frame {current_frame_idx}")
                     predicted_token = self.tokenizer.pad_id
 
             gen_text[:, current_frame_idx] = predicted_token
