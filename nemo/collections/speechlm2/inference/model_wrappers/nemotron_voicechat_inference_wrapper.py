@@ -911,6 +911,7 @@ class NemotronVoicechatInferenceWrapper:
             from nemo.collections.speechlm2.inference.model_wrappers.agent_handler import BackendAgentHandler
             self.agent_handler = BackendAgentHandler(self.tokenizer, session_id=effective_req)
             self.special_13_occurrence_count = 0
+            self.special_14_occurrence_count = 0
             self._agent_request_id = effective_req
             logging.info(f"Created new BackendAgentHandler for request_id={effective_req}")
 
@@ -1052,12 +1053,32 @@ class NemotronVoicechatInferenceWrapper:
                 pred_id = predicted_token.item() if torch.is_tensor(predicted_token) else predicted_token
 
                 if pred_id == self.tokenizer.special_13_id or pred_id == self.tokenizer.special_14_id:
-                    self.special_13_occurrence_count += 1
+                    self.special_13_occurrence_count =1
                     if not self.agent_handler._request_sent:
                         logging.info("SPECIAL_13 detected — calling backend agent service (async)...")
                         self.agent_handler.on_special_13_detected(gen_text, gen_asr_text, current_frame_idx)
 
-                if self.agent_handler._request_sent and self.agent_handler.response_ready:
+                    if pred_id == self.tokenizer.special_14_id:
+                        self.special_14_occurrence_count = 1
+
+                if self.special_14_occurrence_count > 0:
+                    self.special_14_occurrence_count += 1  # for enough buffer before agent response
+
+                if self.special_13_occurrence_count > 0:
+                    self.special_13_occurrence_count += 1
+
+                # to avoid agent emit special_15 token
+                # special_15 should only be emitted by backend agent service
+                if self.special_13_occurrence_count > 0 and pred_id == self.tokenizer.special_15_id:
+                    logging.info(f"SPECIAL_15 detected — replacing with pad_id at frame {current_frame_idx}")
+                    predicted_token = self.tokenizer.pad_id
+
+                if self.agent_handler._request_sent and (self.special_14_occurrence_count > 0 or self.special_13_occurrence_count > 20):
+                    # request has been sent
+                    # we just make the model silent; do not respond to the user
+                    predicted_token = self.tokenizer.pad_id
+
+                if self.agent_handler._request_sent and self.agent_handler.response_ready and self.special_14_occurrence_count > 11:
                     response_tokens = self.agent_handler.get_all_response_token_ids()
                     if response_tokens:
                         logging.info(f"Backend response ready ({len(response_tokens)} tokens) — performing FC prefill at frame {current_frame_idx}")
@@ -1069,14 +1090,12 @@ class NemotronVoicechatInferenceWrapper:
                         if updated_cache is not None:
                             dynamic_cache = updated_cache
                         self.special_13_occurrence_count = 0
+                        self.special_14_occurrence_count = 0
                         self.agent_handler.reset()
-
-                # to avoid agent emit special_15 token
-                # special_15 should only be emitted by backend agent service
-                if self.special_13_occurrence_count > 0 and pred_id == self.tokenizer.special_15_id:
-                    logging.info(f"SPECIAL_15 detected — replacing with pad_id at frame {current_frame_idx}")
-                    predicted_token = self.tokenizer.pad_id
-                
+                        # after we do prefill, we need to update the predicted_token to agent_bos
+                        # due to the finetuning logic <special_15>....<special_16><agent_bos>...</agent_bos>
+                        predicted_token = self.tokenizer.bos_id
+ 
                 # to avoid agent emit eos token immediately after agent response text
                 if pred_id == self.tokenizer.eos_id and gen_text[:, current_frame_idx - 1] != self.tokenizer.pad_id:
                     logging.info(f"EOS detected — replacing with pad_id at frame {current_frame_idx}")
