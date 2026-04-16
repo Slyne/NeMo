@@ -79,6 +79,24 @@ class ModelInterface(ABC):
         self.top_p = top_p
         self.repetition_penalty = repetition_penalty
         self.temperature = temperature
+        self._special_token_lookup_cache = {}
+
+    def _get_special_token_lookup(self, device: torch.device, vocab_size: int) -> torch.Tensor:
+        """Cache a vocab-sized boolean lookup for special tokens per device."""
+        key = (device, vocab_size)
+        cached = self._special_token_lookup_cache.get(key)
+        if cached is not None:
+            return cached
+
+        lookup = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+        if self.special_token_ids:
+            indices = torch.tensor(sorted(self.special_token_ids), dtype=torch.long, device=device)
+            valid = indices[(indices >= 0) & (indices < vocab_size)]
+            if valid.numel() > 0:
+                lookup[valid] = True
+
+        self._special_token_lookup_cache[key] = lookup
+        return lookup
 
     def _sample_text_token(
         self,
@@ -98,9 +116,6 @@ class ModelInterface(ABC):
         Returns:
             Sampled token ids of shape (B,).
         """
-        B, V = logits.shape
-        device = logits.device
-
         # First check greedy tokens (on original logits)
         greedy_tokens = logits.argmax(dim=-1)  # (B,)
 
@@ -113,34 +128,32 @@ class ModelInterface(ABC):
             return greedy_tokens
 
         # For each batch, if greedy is special token, use greedy; otherwise sample
+        vocab_size = logits.shape[-1]
+        special_lookup = self._get_special_token_lookup(logits.device, vocab_size)
         sampled_tokens = greedy_tokens.clone()
+        active_batch_indices = (~special_lookup[greedy_tokens]).nonzero(as_tuple=False).flatten()
 
-        for b in range(B):
-            # If greedy token is a special token, keep it (no sampling)
-            if greedy_tokens[b].item() in self.special_token_ids:
-                continue
-
+        for b in active_batch_indices.tolist():
             # Not a special token - apply repetition penalty and sampling
             batch_logits = logits[b].clone()  # (V,)
 
             # Apply repetition penalty
             if self.repetition_penalty != 1.0 and current_step > 0:
                 prev_tokens = generated_tokens[b, :current_step]
-                unique_prev = prev_tokens.unique()
-                # Exclude special tokens from penalty
-                if self.special_token_ids:
-                    # Use unique_prev.device to ensure tensors are on the same device
-                    # (generated_tokens may be on a different device than logits, e.g., vLLM returns CPU logits)
-                    special_tensor = torch.tensor(list(self.special_token_ids), device=unique_prev.device)
-                    mask = ~torch.isin(unique_prev, special_tensor)
-                    unique_prev = unique_prev[mask]
-
-                for token_id in unique_prev:
-                    token_id = token_id.item()
-                    if batch_logits[token_id] > 0:
-                        batch_logits[token_id] = batch_logits[token_id] / self.repetition_penalty
-                    else:
-                        batch_logits[token_id] = batch_logits[token_id] * self.repetition_penalty
+                if prev_tokens.numel() > 0:
+                    # vLLM may return CPU logits while generation history stays on CUDA.
+                    # Move indices onto the logits device before tensor indexing.
+                    if prev_tokens.device != batch_logits.device:
+                        prev_tokens = prev_tokens.to(device=batch_logits.device)
+                    prev_tokens = prev_tokens[~special_lookup[prev_tokens]]
+                    if prev_tokens.numel() > 0:
+                        unique_prev = prev_tokens.unique()
+                        penalized_logits = batch_logits[unique_prev]
+                        batch_logits[unique_prev] = torch.where(
+                            penalized_logits > 0,
+                            penalized_logits / self.repetition_penalty,
+                            penalized_logits * self.repetition_penalty,
+                        )
 
             # Apply temperature scaling
             if self.temperature != 1.0:
@@ -500,10 +513,24 @@ class VllmLLMModel(ModelInterface):
         if text_token_ids:
             is_finished = len(text_token_ids) < decode_steps or (result and result.is_finished)
 
-        text_logits = result.custom_outputs["text_logits"] if result else None
-
         predicted_token = text_token_ids[-1]
-        if self.top_p < 1.0 or self.repetition_penalty != 1.0 or (self.temperature != 1.0 and self.temperature != 0.0):
+        text_logits = result.custom_outputs["text_logits"] if result else None
+        sampling_active = self.top_p < 1.0 or self.repetition_penalty != 1.0 or (self.temperature != 1.0 and self.temperature != 0.0)
+
+        if sampling_active:
+            # vLLM may surface logits on CPU while decode inputs live on CUDA.
+            # When sampling is active, colocate logits with the best available
+            # CUDA anchor so the wrapper sampler can run entirely on GPU.
+            if text_logits is not None:
+                target_device = None
+                if generated_tokens is not None:
+                    target_device = generated_tokens.device
+                elif hasattr(input_embeds, "device"):
+                    target_device = input_embeds.device
+
+                if target_device is not None and text_logits.device != target_device and target_device.type == "cuda":
+                    text_logits = text_logits.to(device=target_device)
+
             # Use provided generated_tokens or create empty tensor
             batch_size = text_logits.shape[0]
             if generated_tokens is None:

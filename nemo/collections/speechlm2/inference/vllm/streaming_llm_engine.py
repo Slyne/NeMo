@@ -28,7 +28,6 @@ from enum import Enum
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.config.model import CustomInputSpec
 from vllm.attention.selector import _cached_get_attn_backend
 
 from nemo.utils import logging
