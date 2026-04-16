@@ -860,13 +860,19 @@ class NemotronVoicechatInferenceWrapper:
         prefill_embeds = text_emb + pad_asr_emb
 
         if self.use_vllm_llm:
+            time_fc_prefill_start = time.time()
             with torch.no_grad():
-                for t in range(num_positions):
-                    self.model_llm_interface(
-                        prefill_embeds[:, t:t+1, :],
-                        request_id=effective_request_id,
-                    )
-            logging.info(f"[FC prefill] vLLM step-by-step prefilled {num_positions} tokens.")
+                success = self.model_llm_interface(
+                    prefill_embeds,
+                    request_id=effective_request_id,
+                    decode_steps=0,
+                    prompt_token_ids=response_token_ids,
+                )
+            time_fc_prefill_end = time.time()
+            logging.info(f"Time taken for FC prefill: {time_fc_prefill_end - time_fc_prefill_start:.3f}s")
+            if not success:
+                raise RuntimeError("vLLM batch prefill for FC response failed.")
+            logging.info(f"[FC prefill] vLLM batch-prefilled {num_positions} tokens.")
             return None
         elif dynamic_cache is not None:
             with torch.no_grad():
@@ -1076,17 +1082,22 @@ class NemotronVoicechatInferenceWrapper:
                 if self.agent_handler._request_sent and (self.special_14_occurrence_count > 0 or self.special_13_occurrence_count > 20):
                     # request has been sent
                     # we just make the model silent; do not respond to the user
-                    predicted_token = self.tokenizer.pad_id
+                    if predicted_token != self.tokenizer.special_14_id or self.special_14_occurrence_count > 2:
+                        logging.info(f"Non special tokens detected during function call— replacing with pad_id at frame {current_frame_idx}")
+                        predicted_token = self.tokenizer.pad_id
 
                 if self.agent_handler._request_sent and self.agent_handler.response_ready and self.special_14_occurrence_count > 11:
                     response_tokens = self.agent_handler.get_all_response_token_ids()
                     if response_tokens:
                         logging.info(f"Backend response ready ({len(response_tokens)} tokens) — performing FC prefill at frame {current_frame_idx}")
+                        time_fc_prefill_start = time.time()
                         updated_cache = self._do_fc_prefill(
                             response_tokens,
                             dynamic_cache, effective_request_id,
                             input_embeds_history,
                         )
+                        time_fc_prefill_end = time.time()
+                        logging.info(f"Time taken for FC prefill: {time_fc_prefill_end - time_fc_prefill_start:.3f}s")
                         if updated_cache is not None:
                             dynamic_cache = updated_cache
                         self.special_13_occurrence_count = 0
@@ -1121,7 +1132,8 @@ class NemotronVoicechatInferenceWrapper:
 
             if self.decode_audio:
                 current_subword_id = gen_text[:, current_frame_idx].unsqueeze(-1)
-
+                if current_subword_id.item() in (self.tokenizer.special_14_id, self.tokenizer.special_13_id):
+                    current_subword_id = torch.full_like(current_subword_id, self.tokenizer.pad_id)
                 # do one step inference on Duplex TTS model
                 if current_frame_idx == 0:
                     if self.first_context_subword_id is None:
@@ -1129,6 +1141,9 @@ class NemotronVoicechatInferenceWrapper:
                     prev_subword_id = self.first_context_subword_id
                 else:
                     prev_subword_id = gen_text[:, current_frame_idx-1].unsqueeze(-1)
+
+                if prev_subword_id.item() in (self.tokenizer.special_14_id, self.tokenizer.special_13_id):
+                    prev_subword_id = torch.full_like(prev_subword_id, self.tokenizer.pad_id)
 
                 # create subword_mask
                 current_subword_mask = subword_mask[:, current_frame_idx].unsqueeze(-1)
