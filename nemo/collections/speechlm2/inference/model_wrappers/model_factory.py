@@ -36,6 +36,7 @@ from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any, Union, Set
 import math
 import os
+import time
 import torch
 from transformers import DynamicCache
 from dataclasses import dataclass
@@ -447,7 +448,8 @@ class VllmLLMModel(ModelInterface):
         decode_steps: int = 1,
         prompt_token_ids: Optional[list] = None,
         generated_tokens: Optional[torch.Tensor] = None,
-        current_step: int = 0
+        current_step: int = 0,
+        skip_sampler: bool = False,
     ) -> Dict[str, Any]:
         """
         Process embeddings sequentially to generate text and ASR tokens.
@@ -460,6 +462,7 @@ class VllmLLMModel(ModelInterface):
             generated_tokens: Previously generated tokens [batch, num_generated].
                              Required for repetition_penalty. If None, creates empty tensor.
             current_step: Current decoding step. Used for repetition penalty.
+            skip_sampler: If True, bypass wrapper sampling and return the engine token.
         """
 
         if decode_steps == 0:
@@ -498,7 +501,9 @@ class VllmLLMModel(ModelInterface):
 
         predicted_token = text_token_ids[-1]
         text_logits = result.custom_outputs["text_logits"] if result else None
-        sampling_active = self.top_p < 1.0 or self.repetition_penalty != 1.0 or (self.temperature != 1.0 and self.temperature != 0.0)
+        sampling_active = (not skip_sampler) and (
+            self.top_p < 1.0 or self.repetition_penalty != 1.0 or (self.temperature != 1.0 and self.temperature != 0.0)
+        )
 
         if sampling_active:
             # vLLM may surface logits on CPU while decode inputs live on CUDA.
@@ -521,11 +526,13 @@ class VllmLLMModel(ModelInterface):
                 gen_tokens = generated_tokens
 
             # Apply sampling with top-p and repetition penalty
+            start_sampling = time.time()
             predicted_token = self._sample_text_token(
                 logits=text_logits,
                 generated_tokens=gen_tokens,
                 current_step=current_step,
             )
+            logging.info(f"Time taken for sampler: {time.time() - start_sampling:.3f}s")
 
         ans = {
             "predicted_token": predicted_token,
@@ -847,6 +854,7 @@ class NativeModel(ModelInterface):
         cache: Optional[Any] = None,
         generated_tokens: Optional[torch.Tensor] = None,
         current_step: int = 0,
+        skip_sampler: bool = False,
         **kwargs
     ) -> Dict[str, Any]:
         """
@@ -858,6 +866,7 @@ class NativeModel(ModelInterface):
             generated_tokens: Previously generated tokens [batch, num_generated].
                              Required for repetition_penalty. If None, creates empty tensor.
             current_step: Current decoding step. Used for repetition penalty.
+            skip_sampler: If True, bypass wrapper sampling and use greedy engine logits.
             **kwargs: Additional arguments passed to the model
 
         Returns:
@@ -882,12 +891,17 @@ class NativeModel(ModelInterface):
         else:
             gen_tokens = generated_tokens
 
-        # Apply sampling with top-p and repetition penalty
-        predicted_token = self._sample_text_token(
-            logits=text_logits,
-            generated_tokens=gen_tokens,
-            current_step=current_step,
-        )
+        if skip_sampler:
+            predicted_token = text_logits.argmax(dim=-1)
+        else:
+            # Apply sampling with top-p and repetition penalty
+            start_sampling = time.time()
+            predicted_token = self._sample_text_token(
+                logits=text_logits,
+                generated_tokens=gen_tokens,
+                current_step=current_step,
+            )
+            logging.info(f"Time taken for sampler: {time.time() - start_sampling:.3f}s")
 
         # ASR tokens use greedy decoding (no sampling)
         asr_predicted_token = result["asr_logits"][:, -1].argmax(dim=-1)

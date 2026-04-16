@@ -867,6 +867,7 @@ class NemotronVoicechatInferenceWrapper:
                     request_id=effective_request_id,
                     decode_steps=0,
                     prompt_token_ids=response_token_ids,
+                    skip_sampler=True,
                 )
             time_fc_prefill_end = time.time()
             logging.info(f"Time taken for FC prefill: {time_fc_prefill_end - time_fc_prefill_start:.3f}s")
