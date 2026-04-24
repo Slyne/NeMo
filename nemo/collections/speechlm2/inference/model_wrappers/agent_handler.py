@@ -4,13 +4,14 @@ Handler for calling the backend LangGraph agent service from the S2S pipeline.
 When the S2S model detects a SPECIAL_13 token (function-call trigger), this handler:
 1. Extracts conversation history from the gen_text and gen_asr_text token streams
 2. Sends the history to the backend agent service via /inject
-3. Calls /query with the latest user utterance
-4. Returns the agent's response as token IDs wrapped by SPECIAL_15/SPECIAL_16,
+3. Submits an async task via /tasks
+4. Waits for an external reinjection request to deliver the final text response
+5. Returns the response as token IDs wrapped by SPECIAL_15/SPECIAL_16,
    ready to be injected into the LLM's KV cache via prefill.
 
 Usage:
     handler = BackendAgentHandler(tokenizer, agent_url="http://localhost:8100")
-    handler.on_special_13_detected(gen_text, gen_asr_text, current_frame_idx)
+    handler.tool_call_detected(gen_text, gen_asr_text, current_frame_idx)
     # ... later, when response_ready is True:
     token_ids = handler.get_all_response_token_ids()
 """
@@ -56,6 +57,8 @@ def normalize_for_speech(text: str) -> str:
 
 
 class BackendAgentHandler:
+    _handlers_by_session: dict[str, "BackendAgentHandler"] = {}
+
     def __init__(
         self,
         tokenizer,
@@ -66,8 +69,10 @@ class BackendAgentHandler:
         self.tokenizer = tokenizer
         self.agent_url = agent_url or os.environ.get("AGENT_SERVICE_URL", "http://localhost:8100")
         self.timeout = timeout
+        self.callback_url = os.environ.get("AGENT_CALLBACK_URL", "").strip() or None
 
         self.session_id = session_id or str(uuid.uuid4())
+        self._handlers_by_session[self.session_id] = self
         logger.info(f"BackendAgentHandler initialized (session={self.session_id}, url={self.agent_url})")
 
         self.bos_id = tokenizer.bos_id
@@ -82,6 +87,8 @@ class BackendAgentHandler:
         self._response_idx: int = 0
         self._pending: bool = False
         self._request_sent: bool = False
+        self._task_id: str | None = None
+        self._last_delivery_error: str | None = None
 
     def extract_conversation_turns(self, gen_text, gen_asr_text, up_to_frame: int) -> list[dict]:
         """Extract user and agent conversation turns from the token streams.
@@ -152,8 +159,11 @@ class BackendAgentHandler:
         return segments
 
     def on_special_13_detected(self, gen_text, gen_asr_text, current_frame_idx: int):
-        """Called when SPECIAL_13 is first detected. Fires the backend request in a background thread
-        so the inference loop can keep generating tokens without blocking."""
+        """Backward-compatible alias for async task submission."""
+        self.tool_call_detected(gen_text, gen_asr_text, current_frame_idx)
+
+    def tool_call_detected(self, gen_text, gen_asr_text, current_frame_idx: int):
+        """Submit an async backend task when SPECIAL_13/14 is first detected."""
         if self._request_sent:
             return
 
@@ -168,20 +178,20 @@ class BackendAgentHandler:
         history = turns[:-1]
         last_turn = turns[-1]
 
-        logger.info(f"Launching async backend request (history={len(history)} turns, query={last_turn})")
+        logger.info(f"Launching async backend task (history={len(history)} turns, query={last_turn})")
         logger.info("Conversation history being sent to backend agent:")
         for i, turn in enumerate(turns):
             logger.info(f"  [{i}] {turn['role']}: {turn['content']}")
 
         thread = threading.Thread(
-            target=self._backend_request_worker,
+            target=self._backend_task_worker,
             args=(history, last_turn),
             daemon=True,
         )
         thread.start()
 
-    def _backend_request_worker(self, history: list[dict], last_turn: dict):
-        """Runs in a background thread — sends inject + query to the backend agent."""
+    def _backend_task_worker(self, history: list[dict], last_turn: dict):
+        """Runs in a background thread — injects history and submits /tasks."""
         try:
             if history:
                 resp = requests.post(
@@ -192,46 +202,68 @@ class BackendAgentHandler:
                 resp.raise_for_status()
                 logger.info(f"Injected {len(history)} turns into session {self.session_id}")
 
+            if not self.callback_url:
+                raise RuntimeError(
+                    "AGENT_CALLBACK_URL is not configured. Set it to the external client callback "
+                    "endpoint that will receive the async backend result."
+                )
+
             query_role = last_turn["role"] if last_turn["role"] == "system" else "user"
             message = (
                 last_turn["content"]
                 + "\n\nIMPORTANT: Respond in one or two short conversational sentences only."
             )
             resp = requests.post(
-                f"{self.agent_url}/query",
+                f"{self.agent_url}/tasks",
                 json={
                     "session_id": self.session_id,
                     "message": message,
                     "role": query_role,
+                    "callback_url": self.callback_url,
                 },
                 timeout=self.timeout,
             )
             resp.raise_for_status()
             result = resp.json()
-            response_text = result.get("response", "")
-
-            logger.info(f"Backend agent response (raw): {response_text[:200]}")
-            response_text = normalize_for_speech(response_text)
-            logger.info(f"Backend agent response (normalized): {response_text[:200]}")
-
-            self._response_token_ids = (
-                [self.special_15_id]
-                + self.tokenizer.text_to_ids(response_text)
-                + [self.special_16_id]
+            self._task_id = result.get("task_id")
+            self._last_delivery_error = None
+            logger.info(
+                "Submitted async backend task %s for session %s",
+                self._task_id,
+                self.session_id,
             )
-            self._response_idx = 0
-            self._pending = True
 
         except Exception as e:
-            logger.error(f"Backend agent call failed: {e}")
+            logger.error(f"Backend agent task submission failed: {e}")
             fallback = "I'm sorry, I couldn't process that request right now."
-            self._response_token_ids = (
-                [self.special_15_id]
-                + self.tokenizer.text_to_ids(fallback)
-                + [self.special_16_id]
-            )
-            self._response_idx = 0
-            self._pending = True
+            self.tool_call_response(fallback)
+            self._last_delivery_error = str(e)
+
+    def tool_call_response(self, text: str):
+        """Accept an externally delivered backend response and make it prefill-ready."""
+        response_text = normalize_for_speech(text or "")
+        if not response_text:
+            response_text = "I'm sorry, I couldn't process that request right now."
+
+        logger.info(f"Backend agent response (normalized): {response_text[:200]}")
+        self._response_token_ids = (
+            [self.special_15_id]
+            + self.tokenizer.text_to_ids(response_text)
+            + [self.special_16_id]
+        )
+        self._response_idx = 0
+        self._pending = True
+        self._request_sent = True
+
+    @classmethod
+    def inject_response_for_session(cls, session_id: str, text: str) -> bool:
+        """Push an externally delivered response into the live handler for a session."""
+        handler = cls._handlers_by_session.get(session_id)
+        if handler is None:
+            logger.warning("No BackendAgentHandler found for session %s", session_id)
+            return False
+        handler.tool_call_response(text)
+        return True
 
     def get_next_token(self) -> Optional[int]:
         """Get the next token from the backend response, or None if done."""
@@ -264,14 +296,22 @@ class BackendAgentHandler:
     def is_done(self) -> bool:
         return self._request_sent and not self._pending
 
+    @property
+    def task_id(self) -> str | None:
+        return self._task_id
+
     def reset(self):
         """Reset for the next tool call within the same session."""
         self._response_token_ids = []
         self._response_idx = 0
         self._pending = False
         self._request_sent = False
+        self._task_id = None
+        self._last_delivery_error = None
 
     def reset_session(self):
         """Full reset with a new session ID."""
         self.reset()
+        self._handlers_by_session.pop(self.session_id, None)
         self.session_id = str(uuid.uuid4())
+        self._handlers_by_session[self.session_id] = self

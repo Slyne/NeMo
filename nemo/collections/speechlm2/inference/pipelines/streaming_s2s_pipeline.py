@@ -352,16 +352,23 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 		inference runs.  This is the unified protocol used by both the CLI
 		(``run()``) and the Triton backend.
 		"""
-		# Detect prefill-only frame: is_first + zero-length audio
-		if (len(frames) == 1
-				and frames[0].is_first
-				and frames[0].samples.numel() == 0):
+		# Detect control-only zero-audio frames.
+		if len(frames) == 1 and frames[0].samples.numel() == 0:
 			opts = frames[0].options
-			prompt = None
-			if opts is not None and hasattr(opts, "system_prompt"):
-				prompt = opts.system_prompt
-			self.prefill_for_new_stream(frames[0].stream_id, prompt)
-			return
+			backend_response = getattr(opts, "backend_response", None) if opts is not None else None
+			if backend_response:
+				from nemo.collections.speechlm2.inference.model_wrappers.agent_handler import BackendAgentHandler
+				request_id = self._request_id_for_stream(frames[0].stream_id)
+				if BackendAgentHandler.inject_response_for_session(request_id, backend_response):
+					logging.info("Queued backend response in agent handler for stream %s", frames[0].stream_id)
+				return
+
+			if frames[0].is_first:
+				prompt = None
+				if opts is not None and hasattr(opts, "system_prompt"):
+					prompt = opts.system_prompt
+				self.prefill_for_new_stream(frames[0].stream_id, prompt)
+				return
 
 		buffers, left_paddings = self.bufferer.update(frames)
 		ready_feats = [True] * len(frames)

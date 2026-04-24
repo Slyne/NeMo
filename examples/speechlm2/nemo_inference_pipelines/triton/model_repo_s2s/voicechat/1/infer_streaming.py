@@ -171,8 +171,12 @@ class TritonPythonModel:
         frames = []
         
         for request in requests:
-            # Get audio input
-            audio_signal = pb_utils.get_input_tensor_by_name(request, "audio_signal").as_numpy()
+            # Optional audio input: response-only reinjection requests may omit it.
+            audio_tensor = pb_utils.get_input_tensor_by_name(request, "audio_signal")
+            if audio_tensor is None:
+                audio_signal = np.zeros((1, 0), dtype=np.float32)
+            else:
+                audio_signal = audio_tensor.as_numpy()
             
             # Extract sequence batching metadata from Triton control inputs
             # These are automatically populated when client uses sequence_start/end/id
@@ -201,20 +205,30 @@ class TritonPythonModel:
             except Exception:
                 pass
             
-            # Extract optional per-stream system prompt (sent on the first request)
-            frame_options = None
-            if is_first:
-                system_prompt = None
+            def _read_optional_string_tensor(name: str) -> str | None:
                 try:
-                    prompt_tensor = pb_utils.get_input_tensor_by_name(request, "system_prompt")
-                    if prompt_tensor is not None:
-                        raw = prompt_tensor.as_numpy()[0]
-                        system_prompt = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+                    tensor = pb_utils.get_input_tensor_by_name(request, name)
+                    if tensor is None:
+                        return None
+                    values = tensor.as_numpy()
+                    if values.size == 0:
+                        return None
+                    raw = values[0]
+                    return raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
                 except Exception:
-                    pass
-                if system_prompt is None:
-                    system_prompt = self.pipeline.system_prompt
-                frame_options = S2SRequestOptions(system_prompt=system_prompt)
+                    return None
+
+            system_prompt = _read_optional_string_tensor("system_prompt")
+            backend_response = _read_optional_string_tensor("backend_response")
+            if is_first and system_prompt is None:
+                system_prompt = self.pipeline.system_prompt
+
+            frame_options = None
+            if is_first or backend_response is not None:
+                frame_options = S2SRequestOptions(
+                    system_prompt=system_prompt,
+                    backend_response=backend_response,
+                )
 
             # Zero-length audio = prefill-only frame; pass through without validation
             if audio_signal.size == 0:
@@ -261,7 +275,9 @@ class TritonPythonModel:
             if frame.is_first and frame.samples.numel() == 0:
                 generations.append((torch.empty(1, 0), "", ""))
                 continue
-            
+            if frame.samples.numel() == 0 and frame.options is not None and getattr(frame.options, "backend_response", None):
+                generations.append((torch.empty(1, 0), "", ""))
+                continue
             state = self.pipeline.get_or_create_state(stream_id)
             audio = state.audio_buffer
             

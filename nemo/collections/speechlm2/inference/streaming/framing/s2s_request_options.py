@@ -25,3 +25,4 @@ class S2SRequestOptions:
     """
 
     system_prompt: str | None = None
+    backend_response: str | None = None
