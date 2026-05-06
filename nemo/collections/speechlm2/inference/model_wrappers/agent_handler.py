@@ -17,7 +17,6 @@ Usage:
 """
 
 import os
-import re
 import uuid
 import logging
 import threading
@@ -25,35 +24,6 @@ import requests
 from typing import Optional
 
 logger = logging.getLogger(__name__)
-
-
-def normalize_for_speech(text: str) -> str:
-    """Convert symbols and formatting into speech-friendly text."""
-    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
-    text = re.sub(r'\*(.+?)\*', r'\1', text)
-
-    text = text.replace('°C', ' degrees Celsius')
-    text = text.replace('°F', ' degrees Fahrenheit')
-    text = text.replace('°', ' degrees')
-
-    text = text.replace('%', ' percent')
-    text = text.replace('&', ' and ')
-    text = text.replace('+', ' plus ')
-    text = text.replace('$', ' dollars ')
-    text = text.replace('€', ' euros ')
-    text = text.replace('£', ' pounds ')
-
-    text = text.replace('\u202f', ' ')
-    text = text.replace('\u00a0', ' ')
-    text = text.replace('\xa0', ' ')
-
-    text = re.sub(r'^[-•]\s*', '', text, flags=re.MULTILINE)
-    text = re.sub(r'^\d+\.\s+', '', text, flags=re.MULTILINE)
-
-    text = text.replace('\n', ' ')
-    text = re.sub(r'\s{2,}', ' ', text)
-
-    return text.strip()
 
 
 class BackendAgentHandler:
@@ -89,6 +59,7 @@ class BackendAgentHandler:
         self._request_sent: bool = False
         self._task_id: str | None = None
         self._last_delivery_error: str | None = None
+        self._synced_turn_count: int = 0
 
     def extract_conversation_turns(self, gen_text, gen_asr_text, up_to_frame: int) -> list[dict]:
         """Extract user and agent conversation turns from the token streams.
@@ -175,22 +146,32 @@ class BackendAgentHandler:
             logger.warning("No conversation turns found to send to backend agent.")
             return
 
-        history = turns[:-1]
+        history_end = len(turns) - 1
+        history_start = min(self._synced_turn_count, history_end)
+        history = turns[history_start:history_end]
         last_turn = turns[-1]
 
-        logger.info(f"Launching async backend task (history={len(history)} turns, query={last_turn})")
+        if history_start < history_end:
+            logger.info(
+                "Launching async backend task (%s new history turns, query=%s)",
+                len(history),
+                last_turn,
+            )
+        else:
+            logger.info("Launching async backend task (no new history turns, query=%s)", last_turn)
         logger.info("Conversation history being sent to backend agent:")
-        for i, turn in enumerate(turns):
+        for i, turn in enumerate(history, start=history_start):
             logger.info(f"  [{i}] {turn['role']}: {turn['content']}")
+        logger.info(f"  [{len(turns) - 1}] {last_turn['role']}: {last_turn['content']} (query)")
 
         thread = threading.Thread(
             target=self._backend_task_worker,
-            args=(history, last_turn),
+            args=(history, last_turn, len(turns)),
             daemon=True,
         )
         thread.start()
 
-    def _backend_task_worker(self, history: list[dict], last_turn: dict):
+    def _backend_task_worker(self, history: list[dict], last_turn: dict, observed_turn_count: int):
         """Runs in a background thread — injects history and submits /tasks."""
         try:
             if history:
@@ -209,10 +190,7 @@ class BackendAgentHandler:
                 )
 
             query_role = last_turn["role"] if last_turn["role"] == "system" else "user"
-            message = (
-                last_turn["content"]
-                + "\n\nIMPORTANT: Respond in one or two short conversational sentences only."
-            )
+            message = last_turn["content"]
             resp = requests.post(
                 f"{self.agent_url}/tasks",
                 json={
@@ -227,6 +205,10 @@ class BackendAgentHandler:
             result = resp.json()
             self._task_id = result.get("task_id")
             self._last_delivery_error = None
+            # The backend session now has all turns observed up through the
+            # current query turn. The tool response itself is not part of the
+            # gen_text/gen_asr_text streams, so it must not advance this cursor.
+            self._synced_turn_count = observed_turn_count
             logger.info(
                 "Submitted async backend task %s for session %s",
                 self._task_id,
@@ -241,11 +223,11 @@ class BackendAgentHandler:
 
     def tool_call_response(self, text: str):
         """Accept an externally delivered backend response and make it prefill-ready."""
-        response_text = normalize_for_speech(text or "")
+        response_text = (text or "").strip()
         if not response_text:
             response_text = "I'm sorry, I couldn't process that request right now."
 
-        logger.info(f"Backend agent response (normalized): {response_text[:200]}")
+        logger.info(f"Backend agent response: {response_text[:200]}")
         self._response_token_ids = (
             [self.special_15_id]
             + self.tokenizer.text_to_ids(response_text)
@@ -315,3 +297,4 @@ class BackendAgentHandler:
         self._handlers_by_session.pop(self.session_id, None)
         self.session_id = str(uuid.uuid4())
         self._handlers_by_session[self.session_id] = self
+        self._synced_turn_count = 0
