@@ -118,6 +118,108 @@ def test_preference_sampling_excludes_zero_weight_and_empty_targets():
 
 
 @pytest.mark.unit
+def test_preference_prompt_sampling_uses_static_prompt_without_changing_target():
+    code_switch_instruction = {
+        "prompt": "Preserve the code-switched utterance.",
+        "target": "Bonjour world.",
+        "tags": {"type": "code_switched", "target_lang": "fr"},
+    }
+    cut = _make_cut(custom={"preference_instructions": [code_switch_instruction]})
+
+    conversation = sample_preference_to_conversation(
+        cut,
+        audio_locator_tag="<audio>",
+        token_equivalent_duration=0.25,
+        prompt_sampling={
+            "code_switched": [
+                {"prompt": "Transcribe the following:", "weight": 1.0},
+                {"use_manifest_prompt": True, "weight": 0.0},
+            ]
+        },
+    )
+
+    assert conversation.custom["_pref_type"] == "code_switched"
+    assert conversation.turns[0].value == "Transcribe the following:"
+    assert conversation.turns[1].text == code_switch_instruction["target"]
+    assert conversation.turns[2].value == code_switch_instruction["target"]
+
+
+@pytest.mark.unit
+def test_preference_prompt_sampling_can_preserve_manifest_prompt():
+    conversation = sample_preference_to_conversation(
+        _make_cut(unique_id=19),
+        audio_locator_tag="<audio>",
+        token_equivalent_duration=0.25,
+        weights={"translation": 1.0, "summary": 0.0},
+        prompt_sampling={
+            "translation": [
+                {"prompt": "A static replacement.", "weight": 0.0},
+                {"use_manifest_prompt": True, "weight": 1.0},
+            ]
+        },
+    )
+
+    assert conversation.turns[0].value == "Translate the audio."
+
+
+@pytest.mark.unit
+def test_preference_prompt_sampling_is_task_specific_and_deterministic():
+    prompt_sampling = {
+        "summary": [
+            {"prompt": "Give me the gist.", "weight": 2.0},
+            {"use_manifest_prompt": True, "weight": 1.0},
+        ]
+    }
+
+    first = sample_preference_to_conversation(
+        _make_cut(unique_id=23),
+        audio_locator_tag="<audio>",
+        token_equivalent_duration=0.25,
+        weights={"translation": 0.0, "summary": 1.0},
+        prompt_sampling=prompt_sampling,
+        seed=99,
+    )
+    second = sample_preference_to_conversation(
+        _make_cut(unique_id=23),
+        audio_locator_tag="<audio>",
+        token_equivalent_duration=0.25,
+        weights={"translation": 0.0, "summary": 1.0},
+        prompt_sampling=prompt_sampling,
+        seed=99,
+    )
+
+    assert [turn.to_dict() for turn in first.turns] == [turn.to_dict() for turn in second.turns]
+    assert first.turns[0].value in {"Give me the gist.", "Summarize the audio."}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "variants,match",
+    [
+        ([], "non-empty list"),
+        ([{"prompt": "x", "use_manifest_prompt": True}], "exactly one"),
+        ([{"weight": 1.0}], "exactly one"),
+        ([{"prompt": 123}], "string or None"),
+        ([{"prompt": "x", "use_manifest_prompt": False}], "must set.*to true"),
+        ([{"prompt": "x", "weight": -1.0}], "finite non-negative weight"),
+        ([{"prompt": "x", "weight": float("nan")}], "finite non-negative weight"),
+        ([{"prompt": "x", "weight": "heavy"}], "non-numeric weight"),
+        ([{"prompt": "x", "weight": 0.0}], "positive sum"),
+        ([{"prompt": "x", "unknown": True}], "unsupported keys"),
+    ],
+)
+def test_preference_prompt_sampling_validates_variants(variants, match):
+    with pytest.raises(ValueError, match=match):
+        sample_preference_to_conversation(
+            _make_cut(unique_id=29),
+            audio_locator_tag="<audio>",
+            token_equivalent_duration=0.25,
+            weights={"translation": 1.0, "summary": 0.0},
+            prompt_sampling={"translation": variants},
+        )
+
+
+@pytest.mark.unit
 def test_preference_sampling_falls_back_to_configured_transcript():
     cut = _make_cut(
         custom={
@@ -157,6 +259,11 @@ def test_lhotse_as_conversation_routes_preference_sampling_config(monkeypatch):
                 "weights": {"translation": 1.0, "summary": 0.0},
                 "seed": 17,
                 "fallback_text_field": "normalized_text",
+                "prompt_sampling": {
+                    "translation": [
+                        {"prompt": "Transcribe the following:", "weight": 1.0},
+                    ]
+                },
             },
         }
     )
@@ -166,6 +273,6 @@ def test_lhotse_as_conversation_routes_preference_sampling_config(monkeypatch):
 
     assert is_tarred is False
     assert conversation.custom["_pref_type"] == "translation"
-    assert conversation.turns[0].value == "Translate the audio."
+    assert conversation.turns[0].value == "Transcribe the following:"
     assert conversation.turns[-1].value == "Bonjour le monde."
     assert conversation.token_equivalent_duration == 0.5

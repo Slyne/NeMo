@@ -888,6 +888,7 @@ def sample_preference_to_conversation(
     weights: dict | None = None,
     seed: int = 42,
     fallback_text_field: str = "pnc_text",
+    prompt_sampling: dict | None = None,
 ) -> NeMoMultimodalConversation:
     """Sample one instruction from a cut's ``preference_instructions`` and build a conversation.
 
@@ -906,6 +907,13 @@ def sample_preference_to_conversation(
     ``weights`` may reference any of the task ``type`` strings; it is renormalized per cut over the
     instruction types actually present (types with weight 0 or absent are excluded). If a cut has no
     usable instruction, we fall back to plain transcription using ``cut.custom[fallback_text_field]``.
+
+    ``prompt_sampling`` optionally maps a task ``type`` to a weighted list of prompt variants. Each
+    variant must contain either ``prompt`` (a string or ``None``) or
+    ``use_manifest_prompt: true``, plus an optional non-negative ``weight`` (default: 1). This permits
+    semantically equivalent prompt diversification without rewriting the source manifests. Prompt
+    selection uses the same per-cut RNG as task selection and is therefore deterministic. Callers are
+    responsible for only configuring prompts that are compatible with the selected instruction target.
     """
     if isinstance(cut, NeMoMultimodalConversation):
         return cut
@@ -913,6 +921,9 @@ def sample_preference_to_conversation(
     if weights is not None and not isinstance(weights, dict):
         # Accept OmegaConf DictConfig etc.
         weights = OmegaConf.to_container(weights, resolve=True)
+    if prompt_sampling is not None and not isinstance(prompt_sampling, dict):
+        # Accept OmegaConf DictConfig etc.
+        prompt_sampling = OmegaConf.to_container(prompt_sampling, resolve=True)
 
     custom = cut.custom or {}
     instructions = custom.get("preference_instructions") or []
@@ -937,6 +948,57 @@ def sample_preference_to_conversation(
         target = chosen["target"]
         target_lang = (chosen.get("tags") or {}).get("target_lang")
         chosen_type = _type_of(chosen)
+        if prompt_sampling is not None and (variants := prompt_sampling.get(chosen_type)) is not None:
+            if not isinstance(variants, (list, tuple)) or not variants:
+                raise ValueError(
+                    f"preference_sampling.prompt_sampling[{chosen_type!r}] must be a non-empty list, got {variants!r}"
+                )
+
+            variant_weights = []
+            for variant in variants:
+                if not isinstance(variant, dict):
+                    raise ValueError(
+                        f"Each prompt variant for task {chosen_type!r} must be a mapping, got {variant!r}"
+                    )
+                unknown_keys = set(variant) - {"prompt", "use_manifest_prompt", "weight"}
+                if unknown_keys:
+                    raise ValueError(
+                        f"Prompt variant for task {chosen_type!r} has unsupported keys: {sorted(unknown_keys)}"
+                    )
+                has_prompt = "prompt" in variant
+                has_manifest_option = "use_manifest_prompt" in variant
+                if has_manifest_option and variant["use_manifest_prompt"] is not True:
+                    raise ValueError(
+                        f"Prompt variant for task {chosen_type!r} must set 'use_manifest_prompt' to true, "
+                        f"got {variant!r}"
+                    )
+                if has_prompt == has_manifest_option:
+                    raise ValueError(
+                        f"Prompt variant for task {chosen_type!r} must set exactly one of "
+                        f"'prompt' or 'use_manifest_prompt: true', got {variant!r}"
+                    )
+                if has_prompt and variant["prompt"] is not None and not isinstance(variant["prompt"], str):
+                    raise ValueError(
+                        f"Prompt variant for task {chosen_type!r} must use a string or None, got {variant['prompt']!r}"
+                    )
+                try:
+                    variant_weight = float(variant.get("weight", 1.0))
+                except (TypeError, ValueError) as error:
+                    raise ValueError(
+                        f"Prompt variant for task {chosen_type!r} has a non-numeric weight: {variant!r}"
+                    ) from error
+                if not np.isfinite(variant_weight) or variant_weight < 0:
+                    raise ValueError(
+                        f"Prompt variant for task {chosen_type!r} must have a finite non-negative weight, "
+                        f"got {variant_weight}"
+                    )
+                variant_weights.append(variant_weight)
+
+            if not any(variant_weights):
+                raise ValueError(f"Prompt variant weights for task {chosen_type!r} must have a positive sum")
+            prompt_variant = rng.choices(variants, weights=variant_weights, k=1)[0]
+            if prompt_variant.get("use_manifest_prompt") is not True:
+                prompt = prompt_variant["prompt"]
     else:
         # Fallback: plain transcription (no preference instructions available/selected).
         prompt = None
@@ -1369,6 +1431,7 @@ def read_lhotse_as_conversation(config) -> tuple[CutSet, bool]:
                 weights=pref_cfg.get("weights"),
                 seed=pref_cfg.get("seed", 42),
                 fallback_text_field=pref_cfg.get("fallback_text_field", "pnc_text"),
+                prompt_sampling=pref_cfg.get("prompt_sampling"),
             )
         )
     else:
