@@ -102,7 +102,7 @@ class TestNeMoSpeechLMConfig:
         assert calls[0][0][0] == "nemotron_h"
         assert calls[0][1] == {"exist_ok": True}
 
-    def test_vllm_nemotron_h_config_ignores_serialized_derived_layer_types(self):
+    def test_vllm_nemotron_h_config_normalizes_serialized_layer_types(self):
         class FakeNemotronHConfig:
             model_type = "nemotron_h"
 
@@ -114,10 +114,26 @@ class TestNeMoSpeechLMConfig:
                 return ["derived"]
 
         config_cls = _config_module._make_vllm_nemotron_h_config(FakeNemotronHConfig)
-        cfg = config_cls(layers_block_type=["serialized"], hidden_size=2688)
+        cfg = config_cls(
+            layers_block_type=["mamba", "moe", "attention", "mlp"],
+            hybrid_override_pattern="M-M*",
+            hidden_size=2688,
+        )
 
         assert cfg.layers_block_type == ["derived"]
-        assert cfg.init_kwargs == {"hidden_size": 2688}
+        assert cfg.init_kwargs == {"hybrid_override_pattern": "ME*-", "hidden_size": 2688}
+
+    def test_vllm_nemotron_h_config_rejects_unknown_layer_type(self):
+        class FakeNemotronHConfig:
+            model_type = "nemotron_h"
+
+            def __init__(self, **kwargs):
+                self.init_kwargs = kwargs
+
+        config_cls = _config_module._make_vllm_nemotron_h_config(FakeNemotronHConfig)
+
+        with pytest.raises(ValueError, match="Unsupported Nemotron-H layer block type"):
+            config_cls(layers_block_type=["mamba", "unknown"])
 
     def test_hybrid_backbone_aliases_for_vllm(self):
         cfg = NeMoSpeechLMConfig(**_DEFAULT_CONFIG_KWARGS)

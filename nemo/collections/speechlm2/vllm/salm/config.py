@@ -55,13 +55,27 @@ def _make_vllm_nemotron_h_config(base_config_cls):
     Hugging Face serialization includes ``layers_block_type`` in the exported
     backbone config, while vLLM derives that value from
     ``hybrid_override_pattern`` and exposes it as a property without a setter.
-    Consume the redundant serialized value before ``PretrainedConfig`` tries
-    to assign it; the canonical pattern remains available to recompute it.
+    Older training configs also use ``-`` for MoE, while vLLM 0.20 uses ``E``
+    and reserves ``-`` for dense MLP. Rebuild the pattern from the explicit
+    serialized layer types, then consume the read-only field before
+    ``PretrainedConfig`` tries to assign it.
     """
 
     class SpeechLMNemotronHConfig(base_config_cls):
         def __init__(self, *args, layers_block_type=None, **kwargs):
-            del layers_block_type
+            if layers_block_type is not None:
+                layer_type_to_pattern = {
+                    "mamba": "M",
+                    "attention": "*",
+                    "moe": "E",
+                    "mlp": "-",
+                }
+                try:
+                    kwargs["hybrid_override_pattern"] = "".join(
+                        layer_type_to_pattern[layer_type] for layer_type in layers_block_type
+                    )
+                except KeyError as error:
+                    raise ValueError(f"Unsupported Nemotron-H layer block type: {error.args[0]!r}") from error
             super().__init__(*args, **kwargs)
 
     SpeechLMNemotronHConfig.__name__ = base_config_cls.__name__
