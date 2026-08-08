@@ -871,6 +871,13 @@ class TestMTPPlugin:
         assert cfg.mtp_hybrid_override_pattern == "*"
 
     @pytest.mark.skipif(not _HAS_CONFIG, reason="NeMoSpeechLMConfig not available")
+    def test_mtp_hybrid_override_pattern_uses_backbone_default(self):
+        cfg = NeMoSpeechLMConfig(**_DEFAULT_CONFIG_KWARGS)
+        cfg.text_config.mtp_hybrid_override_pattern = "*E"
+
+        assert cfg.mtp_hybrid_override_pattern == "*E"
+
+    @pytest.mark.skipif(not _HAS_CONFIG, reason="NeMoSpeechLMConfig not available")
     def test_image_token_index_is_base_vocab_size(self):
         """image_token_index should equal the backbone base vocab size (before padding)."""
         import importlib

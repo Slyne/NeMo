@@ -247,11 +247,14 @@ class NeMoSpeechLMConfig(PretrainedConfig):
     def mtp_hybrid_override_pattern(self) -> str:
         """Hybrid layer pattern for MTP heads, consumed by NemotronHMultiTokenPredictor.
 
-        Reads from the ``mtp.hybrid_override_pattern`` field in config.json.
-        '*' means all-attention; 'M' means all-Mamba2.
+        Prefer an explicit SpeechLM ``mtp.hybrid_override_pattern`` override.
+        Otherwise use the backbone config's architecture-specific default
+        (Nemotron-H vLLM 0.20 defaults to ``*E``: attention plus MoE).
         """
         mtp_cfg = self.__dict__.get("mtp") or {}
-        return mtp_cfg.get("hybrid_override_pattern", "*") if isinstance(mtp_cfg, dict) else "*"
+        if isinstance(mtp_cfg, dict) and mtp_cfg.get("hybrid_override_pattern"):
+            return mtp_cfg["hybrid_override_pattern"]
+        return getattr(self.text_config, "mtp_hybrid_override_pattern", "*")
 
     _ATTR_ALIASES = {
         "rms_norm_eps": "layer_norm_epsilon",
