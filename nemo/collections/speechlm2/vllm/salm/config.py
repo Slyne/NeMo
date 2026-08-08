@@ -49,6 +49,26 @@ def _is_hybrid_backend(architectures: list[str]) -> bool:
     return bool(set(architectures) & _HYBRID_ARCHITECTURES)
 
 
+def _make_vllm_nemotron_h_config(base_config_cls):
+    """Adapt exported Nemotron-H configs to vLLM's read-only derived fields.
+
+    Hugging Face serialization includes ``layers_block_type`` in the exported
+    backbone config, while vLLM derives that value from
+    ``hybrid_override_pattern`` and exposes it as a property without a setter.
+    Consume the redundant serialized value before ``PretrainedConfig`` tries
+    to assign it; the canonical pattern remains available to recompute it.
+    """
+
+    class SpeechLMNemotronHConfig(base_config_cls):
+        def __init__(self, *args, layers_block_type=None, **kwargs):
+            del layers_block_type
+            super().__init__(*args, **kwargs)
+
+    SpeechLMNemotronHConfig.__name__ = base_config_cls.__name__
+    SpeechLMNemotronHConfig.__qualname__ = base_config_cls.__qualname__
+    return SpeechLMNemotronHConfig
+
+
 def _register_vllm_backbone_configs() -> None:
     """Expose vLLM-native backbone configs to Transformers AutoConfig.
 
@@ -63,7 +83,7 @@ def _register_vllm_backbone_configs() -> None:
         # Keep config-only unit tests usable in environments without vLLM.
         return
 
-    AutoConfig.register("nemotron_h", NemotronHConfig, exist_ok=True)
+    AutoConfig.register("nemotron_h", _make_vllm_nemotron_h_config(NemotronHConfig), exist_ok=True)
 
 
 class NeMoSpeechLMConfig(PretrainedConfig):

@@ -100,6 +100,23 @@ class TestNeMoSpeechLMConfig:
         assert calls[0][0][0] == "nemotron_h"
         assert calls[0][1] == {"exist_ok": True}
 
+    def test_vllm_nemotron_h_config_ignores_serialized_derived_layer_types(self):
+        class FakeNemotronHConfig:
+            model_type = "nemotron_h"
+
+            def __init__(self, **kwargs):
+                self.init_kwargs = kwargs
+
+            @property
+            def layers_block_type(self):
+                return ["derived"]
+
+        config_cls = _config_module._make_vllm_nemotron_h_config(FakeNemotronHConfig)
+        cfg = config_cls(layers_block_type=["serialized"], hidden_size=2688)
+
+        assert cfg.layers_block_type == ["derived"]
+        assert cfg.init_kwargs == {"hidden_size": 2688}
+
     def test_hybrid_backbone_aliases_for_vllm(self):
         cfg = NeMoSpeechLMConfig(**_DEFAULT_CONFIG_KWARGS)
         assert cfg.is_hybrid is True
