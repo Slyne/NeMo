@@ -265,6 +265,22 @@ def _uses_automodel_parallel(strategy_cfg: dict) -> bool:
     return "AutomodelParallelStrategy" in target
 
 
+def _set_export_initialization_flags(model_cfg: dict) -> None:
+    """Initialize only constructor structure not serialized in a checkpoint.
+
+    SpeechLM training configs commonly omit the expanded ASR preprocessor and
+    encoder configs because ``setup_speech_encoder`` obtains them from
+    ``pretrained_asr``. DCP stores their tensors but not that constructor
+    schema, so export must restore the ASR structure before loading DCP while
+    still avoiding a redundant base-LLM weight load.
+    """
+    perception_cfg = model_cfg.get("perception", {}) or {}
+    needs_asr_structure = "preprocessor" not in perception_cfg or "encoder" not in perception_cfg
+    model_cfg["pretrained_weights"] = False
+    model_cfg["pretrained_llm_weights"] = False
+    model_cfg["pretrained_asr_weights"] = needs_asr_structure
+
+
 @hydra_runner(config_name="HfExportConfig", schema=HfExportConfig)
 def main(cfg: HfExportConfig) -> None:
     """
@@ -326,7 +342,7 @@ def main(cfg: HfExportConfig) -> None:
 
         # Don't call configure_model() inside __init__ — we set the distributed setup first.
         model_cfg["init_configure_model"] = False
-        model_cfg["pretrained_weights"] = False
+        _set_export_initialization_flags(model_cfg)
         model = cls(model_cfg)
         model.configure_model(distributed_setup=strategy.distributed_setup)
 
@@ -342,7 +358,7 @@ def main(cfg: HfExportConfig) -> None:
         dist.destroy_process_group()
     else:
         model_cfg["init_configure_model"] = True
-        model_cfg["pretrained_weights"] = False
+        _set_export_initialization_flags(model_cfg)
         model = cls(model_cfg)
         load_checkpoint(model, cfg.ckpt_path)
         model = model.to(str_to_dtype(cfg.dtype))

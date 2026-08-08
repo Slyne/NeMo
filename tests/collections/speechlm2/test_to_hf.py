@@ -31,6 +31,23 @@ _spec = importlib.util.spec_from_file_location("to_hf_for_test", _TO_HF_PATH)
 to_hf = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(to_hf)
 
+
+@pytest.mark.parametrize(
+    ("perception", "expected_asr_weights"),
+    [
+        ({"modality_adapter": {}}, True),
+        ({"preprocessor": {}, "encoder": {}}, False),
+    ],
+)
+def test_export_initialization_flags_restore_only_missing_asr_structure(perception, expected_asr_weights):
+    model_cfg = {"perception": perception, "pretrained_weights": True}
+
+    to_hf._set_export_initialization_flags(model_cfg)
+
+    assert model_cfg["pretrained_weights"] is False
+    assert model_cfg["pretrained_llm_weights"] is False
+    assert model_cfg["pretrained_asr_weights"] is expected_asr_weights
+
 AUDIO_TOKEN = "<|audio|>"
 CHAT_TEMPLATE_INLINE = "{% for msg in messages %}{{msg.content}}{% endfor %}"
 CHAT_TEMPLATE_LARGE = "{% for msg in messages %}" + "X" * 4096 + "{{msg.content}}{% endfor %}"
