@@ -90,6 +90,16 @@ class TestNeMoSpeechLMConfig:
         assert hasattr(cfg.text_config, "hidden_size")
         assert cfg.get_text_config() is cfg.text_config
 
+    @pytest.mark.skipif(not _HAS_VLLM, reason="vLLM not available")
+    def test_registers_vllm_nemotron_h_config_before_backbone_load(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(_config_module.AutoConfig, "register", lambda *args, **kwargs: calls.append((args, kwargs)))
+
+        NeMoSpeechLMConfig(**_DEFAULT_CONFIG_KWARGS)
+
+        assert calls[0][0][0] == "nemotron_h"
+        assert calls[0][1] == {"exist_ok": True}
+
     def test_hybrid_backbone_aliases_for_vllm(self):
         cfg = NeMoSpeechLMConfig(**_DEFAULT_CONFIG_KWARGS)
         assert cfg.is_hybrid is True

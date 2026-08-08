@@ -49,6 +49,23 @@ def _is_hybrid_backend(architectures: list[str]) -> bool:
     return bool(set(architectures) & _HYBRID_ARCHITECTURES)
 
 
+def _register_vllm_backbone_configs() -> None:
+    """Expose vLLM-native backbone configs to Transformers AutoConfig.
+
+    Nemotron-H is implemented by vLLM even when the container's Transformers
+    release does not yet recognize ``model_type=nemotron_h``. Registering the
+    bundled config class lets the composed SpeechLM config load its local
+    ``llm_backbone`` without requiring remote code or a Transformers upgrade.
+    """
+    try:
+        from vllm.transformers_utils.configs.nemotron_h import NemotronHConfig
+    except ModuleNotFoundError:
+        # Keep config-only unit tests usable in environments without vLLM.
+        return
+
+    AutoConfig.register("nemotron_h", NemotronHConfig, exist_ok=True)
+
+
 class NeMoSpeechLMConfig(PretrainedConfig):
     """HuggingFace config for NeMo Speech LM multimodal models.
 
@@ -142,6 +159,7 @@ class NeMoSpeechLMConfig(PretrainedConfig):
         self.lora = lora
         self.encoder_chunk_size_seconds = encoder_chunk_size_seconds
 
+        _register_vllm_backbone_configs()
         self.text_config = AutoConfig.from_pretrained(pretrained_llm, trust_remote_code=True)
 
         raw_archs = getattr(self.text_config, "architectures", [])
