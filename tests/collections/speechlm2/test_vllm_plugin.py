@@ -93,7 +93,9 @@ class TestNeMoSpeechLMConfig:
     @pytest.mark.skipif(not _HAS_VLLM, reason="vLLM not available")
     def test_registers_vllm_nemotron_h_config_before_backbone_load(self, monkeypatch):
         calls = []
-        monkeypatch.setattr(_config_module.AutoConfig, "register", lambda *args, **kwargs: calls.append((args, kwargs)))
+        monkeypatch.setattr(
+            _config_module.AutoConfig, "register", lambda *args, **kwargs: calls.append((args, kwargs))
+        )
 
         NeMoSpeechLMConfig(**_DEFAULT_CONFIG_KWARGS)
 
@@ -290,6 +292,18 @@ class TestBackendSelection:
         backend = make_backend(cfg)
         assert isinstance(backend, HybridBackend)
         assert backend.architectures() == ["NemotronHForCausalLM"]
+
+    def test_hybrid_backend_removes_automodel_fp32_holder_from_vllm_keys(self):
+        import torch
+
+        from nemo.collections.speechlm2.vllm.salm.backends import HybridBackend
+
+        backend = HybridBackend(SimpleNamespace(text_config=SimpleNamespace(vocab_size=None)))
+        tensor = torch.ones(2)
+
+        mapped = list(backend.nemo_to_hf_llm_weights([("llm.model.layers.0.mixer._fp32_params.A_log", tensor)]))
+
+        assert mapped == [("backbone.layers.0.mixer.A_log", tensor)]
 
     def test_transformer_config_picks_transformer_backend(self):
         from nemo.collections.speechlm2.vllm.salm.backends import TransformerBackend, make_backend

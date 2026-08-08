@@ -247,6 +247,11 @@ class HybridBackend(_BaseBackend):
         for name, tensor in weights:
             hf_name = name.replace("llm.model.", "backbone.")
             hf_name = hf_name.replace("llm.lm_head", "lm_head")
+            # Automodel isolates intrinsically-fp32 Mamba parameters in an
+            # FSDP-only holder. vLLM's MambaMixer2 keeps the same parameters
+            # directly on the mixer (and its Nemotron-H mapper subsequently
+            # renames A_log -> A), so hide the training-only module boundary.
+            hf_name = hf_name.replace("._fp32_params.", ".")
             if hf_name == "backbone.norm.weight":
                 hf_name = "backbone.norm_f.weight"
 
