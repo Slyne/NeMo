@@ -661,6 +661,7 @@ class SALMAutomodel(LightningModule, HFHubMixin):
                     cu_seqlens=packed_cu_seqlens,
                     projection_sync_group=dp_group,
                     context_parallel_group=cp_group,
+                    projection_sync_group=dp_group,
                 )
                 mtp_raw_loss_by_head = mtp_loss_output.per_depth_losses
                 for head_idx, (kl_loss, tv_loss) in enumerate(
