@@ -659,7 +659,6 @@ class SALMAutomodel(LightningModule, HFHubMixin):
                     lk_lambda=self._mtp_lk_lambda,
                     num_label_tokens=num_frames_global,
                     cu_seqlens=packed_cu_seqlens,
-                    projection_sync_group=dp_group,
                     context_parallel_group=cp_group,
                     projection_sync_group=dp_group,
                 )
