@@ -254,6 +254,60 @@ def test_split_spk_targets_into_chunks_bounds_overestimated_lengths():
     )
 
 
+def test_split_spk_targets_into_chunks_caps_final_tail_to_audio_grid():
+    """Do not mistake an overestimated ASR-grid target tail for high-resolution diarization."""
+    stride = 1280
+    full_chunk_samples = 480_000
+    short_audio_samples = 85_440
+    spk_targets = torch.arange(2 * 536, dtype=torch.float32).reshape(2, 536, 1)
+
+    chunked_spk_targets = _split_spk_targets_into_chunks(
+        spk_targets,
+        input_signal_lengths=[full_chunk_samples, short_audio_samples],
+        chunk_spans=[(0, 0, full_chunk_samples), (1, 0, short_audio_samples)],
+        spk_target_lengths=torch.tensor([375, 536]),
+        spk_target_stride=stride,
+    )
+
+    short_grid_len = (short_audio_samples + stride - 1) // stride
+    assert chunked_spk_targets.shape == (2, 375, 1)
+    assert torch.equal(chunked_spk_targets[0, :, 0], spk_targets[0, :375, 0])
+    assert torch.equal(chunked_spk_targets[1, :short_grid_len, 0], spk_targets[1, :short_grid_len, 0])
+    assert torch.equal(
+        chunked_spk_targets[1, short_grid_len:, 0],
+        spk_targets[1, short_grid_len - 1, 0].expand(375 - short_grid_len),
+    )
+
+
+def test_encode_audio_chunking_caps_missing_rttm_tail_to_audio_grid():
+    stride = 1280
+    full_chunk_samples = 480_000
+    short_audio_samples = 85_440
+    perception = ChunkingTestPerception(sampling_rate=16_000, hop_length=160)
+    perception.encoder = type("Encoder", (), {"subsampling_factor": stride // 160})()
+    audios = torch.zeros(2, full_chunk_samples)
+    audio_lens = torch.tensor([full_chunk_samples, short_audio_samples], dtype=torch.long)
+    spk_targets = torch.zeros(2, 536, 1)
+    spk_targets[1] = -1
+
+    encode_audio_with_optional_chunking(
+        perception,
+        audios,
+        audio_lens,
+        chunk_size_seconds=30.0,
+        sampling_rate=16_000,
+        chunk_batch_size=2,
+        spk_targets=spk_targets,
+        spk_target_lengths=torch.tensor([375, 536]),
+    )
+
+    (chunked_targets,) = perception.spk_targets_calls
+    short_grid_len = (short_audio_samples + stride - 1) // stride
+    assert chunked_targets.shape == (2, 375, 1)
+    assert torch.equal(chunked_targets[1, :short_grid_len], torch.full((short_grid_len, 1), -1.0))
+    assert torch.equal(chunked_targets[1, short_grid_len:], torch.full((375 - short_grid_len, 1), -1.0))
+
+
 @pytest.mark.parametrize(
     ("audio_values", "audio_len", "expected_chunk_lens"),
     [

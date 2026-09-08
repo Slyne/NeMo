@@ -403,7 +403,8 @@ def _split_spk_targets_into_chunks(
             length are bounded to it.
         spk_target_stride: Number of input time units per target frame. When
             provided, chunk boundaries use this fixed frame grid instead of a
-            proportional approximation.
+            proportional approximation. Together with ``spk_target_lengths``,
+            it also bounds serialized target tails to the audio-derived grid.
 
     Returns:
         A padded tensor of chunk-level speaker targets with shape
@@ -437,6 +438,19 @@ def _split_spk_targets_into_chunks(
         target_lengths = [min(length, max_target_len) for length in target_lengths]
     if spk_target_stride is not None and spk_target_stride <= 0:
         raise ValueError(f"spk_target_stride must be positive, got {spk_target_stride}.")
+    if spk_target_stride is not None and spk_target_lengths is not None:
+        # SALM speaker targets already live on the ASR output grid. Their
+        # serialized lengths can overrun the waveform-derived grid after
+        # duration rounding, resampling, or augmentation; forwarding that
+        # tail makes a dense PEE batch look like high-resolution Sortformer
+        # output and triggers an erroneous second downsampling. Bound every
+        # row to the last grid frame that can be supported by its audio.
+        audio_grid_lengths = [
+            (audio_len + spk_target_stride - 1) // spk_target_stride for audio_len in input_signal_lengths
+        ]
+        target_lengths = [
+            min(target_len, audio_grid_len) for target_len, audio_grid_len in zip(target_lengths, audio_grid_lengths)
+        ]
 
     target_chunks = []
     for audio_idx, begin, end in chunk_spans:
