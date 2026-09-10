@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from nemo.collections.speechlm2.data.salm_dataset import MultiSpeakerConfig
+from nemo.collections.speechlm2.parts import encoder_chunking as encoder_chunking_module
 from nemo.collections.speechlm2.parts.encoder_chunking import (
     _recombine_chunked_audio_embeddings,
     _split_audio_into_chunks,
@@ -377,6 +378,47 @@ def test_encode_audio_with_optional_chunking_can_microbatch_chunks():
     assert torch.equal(perception.time_offsets[0], torch.tensor([0.0, 1.0]))
     assert torch.equal(perception.time_offsets[1], torch.tensor([2.0]))
     assert torch.equal(embs[0].squeeze(-1), audios[0])
+
+
+def test_encode_audio_with_optional_chunking_syncs_dummy_forwards_without_changing_gradients(monkeypatch):
+    class TrainableChunkingPerception(ChunkingTestPerception):
+        def __init__(self):
+            super().__init__(sampling_rate=2, hop_length=1)
+            self.scale = torch.nn.Parameter(torch.tensor(2.0))
+
+        def forward(self, **kwargs):
+            embs, lengths = super().forward(**kwargs)
+            return embs * self.scale, lengths
+
+    def raise_synced_microbatch_count(count, *, op, group):
+        assert op is torch.distributed.ReduceOp.MAX
+        assert group is sync_group
+        count.fill_(2)
+
+    sync_group = object()
+    monkeypatch.setattr(encoder_chunking_module.dist, "is_available", lambda: True)
+    monkeypatch.setattr(encoder_chunking_module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(encoder_chunking_module.dist, "all_reduce", raise_synced_microbatch_count)
+    perception = TrainableChunkingPerception()
+
+    embs, dummy_loss = encode_audio_with_optional_chunking(
+        perception,
+        input_signal=torch.tensor([[1.0, 2.0, 3.0, 4.0]]),
+        input_signal_length=torch.tensor([4]),
+        chunk_size_seconds=1.0,
+        sampling_rate=2,
+        chunk_batch_size=2,
+        sync_group=sync_group,
+        return_dummy_loss=True,
+    )
+
+    assert len(perception.calls) == 2
+    assert dummy_loss is not None
+    assert dummy_loss.shape == ()
+    assert dummy_loss.requires_grad
+    assert dummy_loss.item() == 0.0
+    (embs[0].sum() + dummy_loss).backward()
+    torch.testing.assert_close(perception.scale.grad, torch.tensor(10.0))
 
 
 @pytest.mark.parametrize(
