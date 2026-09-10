@@ -338,6 +338,23 @@ def test_encode_audio_with_optional_chunking_does_not_forward_absent_spk_targets
     assert torch.equal(embs[0].squeeze(-1), audios[0])
 
 
+def test_encode_audio_with_optional_chunking_rejects_chunk_size_not_aligned_to_spk_target_stride():
+    perception = ChunkingTestPerception(sampling_rate=2, hop_length=1)
+    perception.encoder = torch.nn.Module()
+    perception.encoder.subsampling_factor = 2
+
+    with pytest.raises(ValueError, match="requires an exact multiple of the 2-sample target stride"):
+        encode_audio_with_optional_chunking(
+            perception,
+            input_signal=torch.zeros(1, 10),
+            input_signal_length=torch.tensor([10], dtype=torch.long),
+            chunk_size_seconds=1.5,
+            sampling_rate=2,
+            spk_targets=torch.zeros(1, 5, 1),
+            spk_target_lengths=torch.tensor([5], dtype=torch.long),
+        )
+
+
 def test_encode_audio_with_optional_chunking_can_microbatch_chunks():
     perception = ChunkingTestPerception(sampling_rate=2, hop_length=1)
     audios = torch.tensor([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]])

@@ -195,7 +195,6 @@ class MultiSpeakerConfig:
     """Configuration for auxiliary multi-speaker SOT targets."""
 
     num_speakers: int
-    no_rttm_to_ones: bool = True
     num_sample_per_mel_frame: int = 160
     num_mel_frame_per_target_frame: int = 8
     max_alignment_permutations: int | None = 720
@@ -215,7 +214,6 @@ class MultiSpeakerConfig:
         max_alignment_permutations = cfg.get('max_alignment_permutations', 720)
         return MultiSpeakerConfig(
             num_speakers=num_speakers,
-            no_rttm_to_ones=cfg.get('no_rttm_to_ones', True),
             num_sample_per_mel_frame=int(cfg.get('window_stride', 0.01) * cfg.get('sample_rate', 16000)),
             num_mel_frame_per_target_frame=int(cfg.get('subsampling_factor', 8)),
             max_alignment_permutations=(
@@ -273,7 +271,6 @@ class SALMMultiSpeakerProcessor:
                         num_speakers=cfg.num_speakers,
                         num_sample_per_mel_frame=cfg.num_sample_per_mel_frame,
                         num_mel_frame_per_target_frame=cfg.num_mel_frame_per_target_frame,
-                        no_rttm_to_ones=cfg.no_rttm_to_ones,
                     )
                     # Request inferred activity instead of the synthetic
                     # single-speaker fallback.  Skip SOT/RTTM column alignment:
@@ -288,7 +285,6 @@ class SALMMultiSpeakerProcessor:
                         num_speakers=cfg.num_speakers,
                         num_sample_per_mel_frame=cfg.num_sample_per_mel_frame,
                         num_mel_frame_per_target_frame=cfg.num_mel_frame_per_target_frame,
-                        no_rttm_to_ones=cfg.no_rttm_to_ones,
                         text=new_text,
                         return_permutation_resolved=True,
                     )

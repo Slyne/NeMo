@@ -219,7 +219,6 @@ data:
     sample_rate: ${data.train_ds.sample_rate}
     window_stride: 0.01                        # preprocessor hop in seconds
     subsampling_factor: 8                      # encoder output stride (mel -> target frames)
-    no_rttm_to_ones: true                      # cuts without RTTM -> single full-duration speaker
 
   train_ds:
     sample_rate: 16000

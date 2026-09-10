@@ -268,16 +268,6 @@ class ParallelExpertEncoderPT(ModelPT):
             spk_kernel_scale=self._cfg.get("spk_kernel_scale", 1.0),
             sync_max_audio_length=self._cfg.get("sync_max_audio_length", False),
         )
-        # Keep the architecture-only bundle config beside the inner module.
-        # SpeechLM HF export embeds this small config in config.json so the
-        # consolidated checkpoint can reconstruct phPEE without carrying a
-        # second, multi-GB copy of its initialization bundle.
-        self.encoder._bundle_config = _clone_config(self._cfg)
-        self.encoder._bundle_config.diar_normalize_type = self.encoder.diar_normalize_type
-        self.encoder._bundle_config.speaker_feature_config_version = _SPEAKER_FEATURE_CONFIG_VERSION
-        self.encoder._bundle_config.speaker_feature_mode = self.encoder.speaker_feature_mode
-        self.encoder._bundle_config.speaker_activity_threshold = self.encoder.speaker_activity_threshold
-        self.encoder._bundle_config.sync_max_audio_length = self.encoder.sync_max_audio_length
 
     @staticmethod
     def _validate_bundle_schema(cfg: DictConfig) -> None:
@@ -376,21 +366,6 @@ class ParallelExpertEncoderPT(ModelPT):
         return bundle.encoder
 
     @classmethod
-    def from_inline_config(
-        cls,
-        cfg: Union[DictConfig, dict],
-        *,
-        map_location: Union[str, torch.device] = "cpu",
-    ) -> ParallelExpertEncoder:
-        """Construct phPEE architecture without loading standalone weights.
-
-        This is intended for consolidated SpeechLM checkpoints, whose root
-        state dict supplies every phPEE tensor after construction.
-        """
-        shell = cls(cfg=OmegaConf.create(cfg), trainer=None)
-        return shell.encoder.to(map_location)
-
-    @classmethod
     def save_to_nemo(
         cls,
         encoder: ParallelExpertEncoder,
@@ -458,8 +433,6 @@ class ParallelExpertEncoder(nn.Module):
     ``asr_encoder_type='transformer'`` selects the native
     :class:`TransformerEncoder` used by Transformer AED ASR checkpoints.
     """
-
-    supports_external_speaker_targets = True
 
     def __init__(
         self,

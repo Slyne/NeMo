@@ -25,13 +25,8 @@ import torch
 SPEAKER_TOKEN_PATTERN = re.compile(r"<spk:(\d+)>")
 _SPEAKER_TOKEN_SPLIT_PATTERN = re.compile(r"(<spk:\d+>)")
 
-# SOT speaker alignment is only used to resolve the RTTM column permutation; the
-# full-resolution activity tensor is returned unchanged apart from that column
-# reorder. Bounding the DTW input to 1,200 frames keeps its
-# O(words * frames * permutations) cost stable for long-form sessions. The
-# effective frame duration is max(80 ms, utterance_duration / 1,200): short inputs
-# are never upsampled, and every coarse bin consumes at least one real input frame.
-# A one-hour session therefore uses 1,200 bins of 37 or 38 frames, or 3.0 seconds each.
+# Alignment only resolves the RTTM column permutation; cap its DTW input at
+# 1,200 frames to bound long-session cost without upsampling short inputs.
 _DEFAULT_ALIGNMENT_FRAME_SECONDS = 0.08
 _DEFAULT_MAX_ALIGNMENT_FRAMES = int(round(96.0 / _DEFAULT_ALIGNMENT_FRAME_SECONDS))
 # Full permutation search is exact and affordable through six active speakers

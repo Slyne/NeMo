@@ -94,6 +94,15 @@ def encode_audio_with_optional_chunking(
 
     min_chunk_size_samples = _get_min_chunk_size_samples(perception)
     chunk_size_samples = max(chunk_size_samples, min_chunk_size_samples)
+    spk_target_stride = (
+        _get_spk_target_stride(perception) if spk_targets is not None and spk_target_lengths is not None else None
+    )
+    if spk_target_stride is not None and chunk_size_samples % spk_target_stride != 0:
+        raise ValueError(
+            f"encoder_chunk_size_seconds={chunk_size_seconds} produces a chunk size of "
+            f"{chunk_size_samples} samples at sampling_rate={sampling_rate}, but speaker-target "
+            f"chunking requires an exact multiple of the {spk_target_stride}-sample target stride."
+        )
     input_signal_lengths = input_signal_length.tolist()
     if max(input_signal_lengths) <= chunk_size_samples and chunk_batch_size is None:
         audio_embs, audio_emb_lens = perception(**perception_kwargs)
@@ -113,9 +122,6 @@ def encode_audio_with_optional_chunking(
     chunk_start_samples = [begin for _, begin, _ in chunk_spans]
     time_offset = torch.as_tensor(chunk_start_samples, device=input_signal_length.device, dtype=torch.float32)
     time_offset = time_offset / float(sampling_rate)
-    spk_target_stride = (
-        _get_spk_target_stride(perception) if spk_targets is not None and spk_target_lengths is not None else None
-    )
     chunked_spk_targets = _split_spk_targets_into_chunks(
         spk_targets,
         input_signal_lengths,

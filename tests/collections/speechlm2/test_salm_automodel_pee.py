@@ -96,7 +96,6 @@ SOT_CFG = {
     "sample_rate": 16000,
     "window_stride": 0.01,
     "subsampling_factor": _SUBSAMPLING_FACTOR,
-    "no_rttm_to_ones": True,
 }
 
 
