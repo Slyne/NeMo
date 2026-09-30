@@ -386,6 +386,12 @@ DFlash2 requires dense logits for candidate selection and therefore requires
 ``tp_size=pp_size=cp_size=1`` and does not directly load the published packed NVFP4 inference
 checkpoint into BF16 training modules.
 
+To warm-start a draft, set ``dflash.init_from_pretrained`` to a local HuggingFace
+draft export matching the configured architecture. Loading rejects missing,
+unexpected, or mismatched weights. This initializes draft weights only; optimizer,
+scheduler, and step counters start fresh. The frozen target is still selected
+independently with the model's checkpoint settings.
+
 For more detailed information on training at scale, model parallelism, and SLURM-based training, see :doc:`training and scaling <training_and_scaling>`.
 
 Collection Structure

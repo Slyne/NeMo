@@ -566,6 +566,44 @@ def test_create_trainer_module_selects_configured_variant(monkeypatch, variant, 
         assert kwargs["use_fused_linear_ce"] is False
 
 
+@pytest.mark.parametrize("variant", ["dflash", "dflash2"])
+def test_draft_hf_warm_start_restores_weights(tmp_path, variant):
+    target = _TrainerTarget()
+    cfg = {
+        "variant": variant,
+        "mask_token_id": 63,
+        "block_size": 4,
+        "draft_num_hidden_layers": 2,
+        "target_layer_ids": [1, 4],
+        "conv_group_size": 8,
+        "selector_rank": 16,
+        "selector_top_k": 64,
+        "attention_backend": "sdpa",
+        "use_fused_linear_ce": False,
+    }
+    module = salm_dflash.SALMDFlashModule(target, {"dflash": cfg})
+    draft_config, _ = salm_dflash._build_draft_config(target.llm.config, cfg, 4, 63)
+    draft_config._attn_implementation = "sdpa"
+    original = module._draft_model_class()(draft_config)
+    original.save_pretrained(tmp_path)
+    cfg["init_from_pretrained"] = str(tmp_path)
+    module = salm_dflash.SALMDFlashModule(target, {"dflash": cfg})
+    restored = module._initialize_draft_model(draft_config, torch.float32)
+    for name, value in original.state_dict().items():
+        torch.testing.assert_close(restored.state_dict()[name], value)
+
+
+def test_draft_hf_warm_start_rejects_incomplete_checkpoint(monkeypatch):
+    module = salm_dflash.SALMDFlashModule(
+        _TrainerTarget(), {"dflash": {"mask_token_id": 63, "init_from_pretrained": "/missing-weights"}}
+    )
+    factory = Mock()
+    factory.from_pretrained.return_value = (nn.Linear(1, 1), {"missing_keys": ["layer.weight"]})
+    monkeypatch.setattr(module, "_draft_model_class", lambda: factory)
+    with pytest.raises(RuntimeError, match="missing_keys"):
+        module._initialize_draft_model(Qwen3Config(), torch.float32)
+
+
 def test_dflash2_salm_components_run_forward_and_train_selector():
     torch.manual_seed(7)
     target = _TrainerTarget()

@@ -357,6 +357,7 @@ exp_manager:
 # when variant=dflash.
 dflash:
   enabled: false
+  init_from_pretrained: null  # Local HF draft export; weights only, fresh optimizer/scheduler.
   variant: dflash2  # dflash or dflash2
   mask_token_id: 990
   draft_num_hidden_layers: 6
