@@ -36,6 +36,7 @@ from nemo.collections.speechlm2.models.salm import replace_placeholders_and_buil
 from nemo.collections.speechlm2.parts.cp_helpers import encode_audio_with_cp_distribution, get_perception_fsdp_group
 from nemo.collections.speechlm2.parts.packed_sequences import _validate_packed_dflash_inputs, pack_audio_for_dflash
 from nemo.core.classes.common import safe_instantiate
+from nemo.utils import logging
 
 _DRAFT_CONFIG_MANAGED_KEYS = {
     "architectures",
@@ -354,8 +355,7 @@ class SALMDFlashModule(LightningModule):
         )
         draft_config._attn_implementation = self.attention_backend
         dtype = next(self.target.llm.parameters()).dtype
-        draft_cls = self._draft_model_class()
-        self.draft_model = draft_cls(draft_config).to(self.target.device, dtype=dtype)
+        self.draft_model = self._initialize_draft_model(draft_config, dtype).to(self.target.device, dtype=dtype)
         if self.dflash_config.get("activation_checkpointing", True):
             self.draft_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
@@ -401,6 +401,25 @@ class SALMDFlashModule(LightningModule):
             use_fused_linear_ce=bool(self.dflash_config.get("use_fused_linear_ce", True)),
             linear_ce_chunk_size=int(self.dflash_config.get("linear_ce_chunk_size", 256)),
         )
+
+    def _initialize_draft_model(self, draft_config, dtype) -> nn.Module:
+        """Initialize fresh draft weights or strictly warm-start a local HF export."""
+        draft_cls = self._draft_model_class()
+        init_path = self.dflash_config.get("init_from_pretrained")
+        if not init_path:
+            return draft_cls(draft_config)
+        draft, loading_info = draft_cls.from_pretrained(
+            init_path, config=draft_config, local_files_only=True, dtype=dtype, output_loading_info=True
+        )
+        failures = {
+            key: loading_info[key]
+            for key in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")
+            if loading_info.get(key)
+        }
+        if failures:
+            raise RuntimeError(f"Incompatible DFlash warm-start checkpoint {init_path}: {failures}")
+        logging.info(f"Warm-started {self.dflash_variant} draft weights from {init_path}")
+        return draft
 
     def _draft_model_class(self) -> type[Qwen3DFlashDraftModel]:
         """Return the draft implementation selected by ``dflash.variant``."""
