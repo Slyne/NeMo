@@ -300,11 +300,8 @@ class SALMDFlashModule(LightningModule):
             loss_type = str(self.dflash_config.get("loss_type", None) or "dflash")
             if loss_type != "dflash":
                 raise ValueError("dflash.loss_type must be 'dflash' when dflash.variant='dflash2'")
-            if bool(self.dflash_config.get("use_fused_linear_ce", False)):
-                raise ValueError(
-                    "dflash.use_fused_linear_ce is not supported by DFlash2 because its path selector needs "
-                    "the draft logits; set it to false"
-                )
+        if bool(self.dflash_config.get("use_fused_linear_ce", False)):
+            raise ValueError("SALM DFlash training requires dflash.use_fused_linear_ce=false (dense draft logits)")
         if self.dflash_config.get("projection_only", False) and (
             self.dflash_variant != "dflash2" or not self.dflash_config.get("init_from_pretrained")
         ):
@@ -412,8 +409,6 @@ class SALMDFlashModule(LightningModule):
             **common_trainer_kwargs,
             loss_type=str(self.dflash_config.get("loss_type", None) or "dflash"),
             prefix_weight_base=float(self.dflash_config.get("prefix_weight_base", 0.9)),
-            use_fused_linear_ce=bool(self.dflash_config.get("use_fused_linear_ce", True)),
-            linear_ce_chunk_size=int(self.dflash_config.get("linear_ce_chunk_size", 256)),
         )
 
     def _initialize_draft_model(self, draft_config, dtype) -> nn.Module:
@@ -530,6 +525,24 @@ class SALMDFlashModule(LightningModule):
             "at llm.model.norm, llm.norm, or llm.transformer.ln_f"
         )
 
+    def _materialize_frozen_lm_head(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Gather the frozen target head once so argmax chunks need no collectives.
+
+        Materialize DTensors explicitly: the head may be owned by an ancestor
+        FSDP unit whose unshard hook is not triggered by calling the head alone.
+        Every rank enters this helper before any data-dependent early return.
+        """
+        head = self.target.llm.get_output_embeddings()
+        weight, bias = head.weight, getattr(head, "bias", None)
+        if bias is not None and bias.numel() == 0:
+            bias = None
+        if weight.requires_grad or (bias is not None and bias.requires_grad):
+            raise ValueError("Target argmax labels require a frozen target LM head")
+        weight = weight.full_tensor() if isinstance(weight, DTensor) else weight
+        if isinstance(bias, DTensor):
+            bias = bias.full_tensor()
+        return weight.to(device=device), bias.to(device=device) if bias is not None else None
+
     @torch.no_grad()
     def _build_target_argmax_labels(self, final_hidden: torch.Tensor, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
         """Build one-step target-model labels without materializing full-sequence logits."""
@@ -544,7 +557,7 @@ class SALMDFlashModule(LightningModule):
 
         # Every rank must enter the head's DTensor gather, including ranks with
         # no supervised successors. Chunking below performs no collectives.
-        weight, bias = self.trainer_module._materialize_frozen_lm_head(final_hidden.device)
+        weight, bias = self._materialize_frozen_lm_head(final_hidden.device)
         labels = input_ids.clone()
         if input_ids.shape[1] <= 1:
             return labels

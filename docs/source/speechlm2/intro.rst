@@ -380,9 +380,8 @@ choose ``dflash.variant`` (``dflash`` or ``dflash2``), and provide a reserved
 preserving SALM's audio-placeholder expansion. The shipped DFlash2 settings mirror Automodel's
 recipe, including its two-tap grouped dynamic convolution, top-16 rank-256 path selector, and
 separately normalized backbone and selector losses. ``max_total_anchors`` bounds both variants'
-anchor allocation. Fused linear cross-entropy further bounds DFlash vocabulary-logit memory, but
-DFlash2 requires dense logits for candidate selection and therefore requires
-``use_fused_linear_ce=false``. This integration supports BSHD and packed THD batches with
+anchor allocation. Both variants use dense draft logits (DFlash2 needs them for
+candidate selection), with ``use_fused_linear_ce=false``. This integration supports BSHD and packed THD batches with
 ``tp_size=pp_size=cp_size=1`` and does not directly load the published packed NVFP4 inference
 checkpoint into BF16 training modules.
 

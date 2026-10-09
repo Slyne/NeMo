@@ -353,8 +353,7 @@ exp_manager:
 # This integration supports DFlash and DFlash2 with BSHD or packed THD batches and
 # tp_size=pp_size=cp_size=1. The DFlash2 defaults mirror Automodel's recipe: a
 # two-tap grouped dynamic convolution and a rank-256 top-16 path selector. DFlash2
-# needs dense draft logits for that selector, so fused linear CE is only available
-# when variant=dflash.
+# needs dense draft logits for that selector. Both variants use dense draft logits.
 dflash:
   enabled: false
   init_from_pretrained: null  # Local HF draft export; weights only, fresh optimizer/scheduler.
@@ -394,8 +393,7 @@ dflash:
   selector_rank: 256
   selector_top_k: 16
   selector_loss_weight: 1.0
-  use_fused_linear_ce: false  # set true only with variant=dflash
-  linear_ce_chunk_size: 256
+  use_fused_linear_ce: false  # SALM draft training uses dense logits.
   target_dtype: bfloat16
   lr: 6.0e-4
   output_dir: ./outputs/salm_dflash

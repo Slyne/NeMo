@@ -563,7 +563,7 @@ def test_create_trainer_module_selects_configured_variant(monkeypatch, variant, 
         assert kwargs["selector_loss_weight"] == pytest.approx(0.25)
         assert "use_fused_linear_ce" not in kwargs
     else:
-        assert kwargs["use_fused_linear_ce"] is False
+        assert "use_fused_linear_ce" not in kwargs
 
 
 @pytest.mark.parametrize("variant", ["dflash", "dflash2"])
@@ -683,7 +683,6 @@ def test_salm_automodel_dflash2_defaults_match_nemotron_3_5_lightning():
     assert dflash_cfg["attention_backend"] == "flex_attention"
     assert dflash_cfg["activation_checkpointing"] is True
     assert dflash_cfg["use_fused_linear_ce"] is False
-    assert dflash_cfg["linear_ce_chunk_size"] == 256
     assert draft_config.num_hidden_layers == 6
     assert draft_config.hidden_size == 2688
     assert draft_config.intermediate_size == 6144
@@ -1313,7 +1312,7 @@ def test_target_argmax_labels_are_causally_shifted_and_do_not_cross_packed_bound
         {"dflash": {"mask_token_id": 18, "label_source": "target_argmax", "target_argmax_chunk_size": 2}},
     )
     weight = torch.eye(4)
-    module.trainer_module = SimpleNamespace(_materialize_frozen_lm_head=Mock(return_value=(weight, None)))
+    module._materialize_frozen_lm_head = Mock(return_value=(weight, None))
     inputs = {
         "input_ids": torch.tensor([[10, 11, 20, 21]]),
         "position_ids": torch.tensor([[0, 1, 0, 1]]),
@@ -1324,7 +1323,7 @@ def test_target_argmax_labels_are_causally_shifted_and_do_not_cross_packed_bound
     labels = module._build_target_argmax_labels(torch.eye(4), inputs)
 
     assert labels.tolist() == [[10, 0, 20, 2]]
-    assert module.trainer_module._materialize_frozen_lm_head.call_count == 1
+    assert module._materialize_frozen_lm_head.call_count == 1
 
 
 def test_target_argmax_hidden_capture_uses_final_norm_and_skips_full_logits():
@@ -1333,7 +1332,7 @@ def test_target_argmax_hidden_capture_uses_final_norm_and_skips_full_logits():
         {"dflash": {"mask_token_id": 18, "label_source": "target_argmax", "target_argmax_chunk_size": 2}},
     )
     module.target_layer_ids = [0, 2]
-    module.trainer_module = SimpleNamespace(_materialize_frozen_lm_head=Mock(return_value=(torch.eye(4), None)))
+    module._materialize_frozen_lm_head = Mock(return_value=(torch.eye(4), None))
     inputs = {
         "input_ids": torch.tensor([[7, 8, 9]]),
         "input_embeddings": torch.tensor([[[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]]]),
@@ -1489,7 +1488,7 @@ def test_target_argmax_matches_dense_logits_with_padding_and_mask(chunk_size):
         _TargetModel(), {"dflash": {"mask_token_id": 18, "target_argmax_chunk_size": chunk_size}}
     )
     weight, bias = torch.randn(7, 4), torch.randn(7)
-    module.trainer_module = SimpleNamespace(_materialize_frozen_lm_head=Mock(return_value=(weight, bias)))
+    module._materialize_frozen_lm_head = Mock(return_value=(weight, bias))
     hidden = torch.randn(2, 5, 4)
     ids = torch.tensor([[0, 0, 4, 3, 2], [1, 2, 3, 4, 5]])
     mask = torch.tensor([[0, 0, 1, 1, 1], [1, 1, 1, 1, 0]], dtype=torch.bool)
@@ -1512,7 +1511,7 @@ def test_target_argmax_final_norm_changes_label_and_cleans_hooks_on_error():
         target.llm.norm.weight.copy_(torch.eye(4).flip(0))
     module = salm_dflash.SALMDFlashModule(target, {"dflash": {"mask_token_id": 18, "label_source": "target_argmax"}})
     module.target_layer_ids = [0, 2]
-    module.trainer_module = SimpleNamespace(_materialize_frozen_lm_head=Mock(return_value=(torch.eye(4), None)))
+    module._materialize_frozen_lm_head = Mock(return_value=(torch.eye(4), None))
     inputs = {
         "input_ids": torch.tensor([[7, 8, 9]]),
         "input_embeddings": torch.eye(4)[:3].unsqueeze(0),
@@ -1523,7 +1522,7 @@ def test_target_argmax_final_norm_changes_label_and_cleans_hooks_on_error():
     assert labels.tolist() == [[7, 3, 2]]
     torch.testing.assert_close(hidden[..., :4], inputs["input_embeddings"] + 1)
     assert not any(m._forward_hooks for m in target.llm.modules())
-    module.trainer_module._materialize_frozen_lm_head.side_effect = RuntimeError("head unavailable")
+    module._materialize_frozen_lm_head.side_effect = RuntimeError("head unavailable")
     with pytest.raises(RuntimeError, match="head unavailable"):
         module._target_hidden_states(inputs)
     assert not any(m._forward_hooks for m in target.llm.modules())
