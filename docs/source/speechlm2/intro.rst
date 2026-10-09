@@ -384,6 +384,38 @@ anchor allocation. Both variants use dense draft logits (DFlash2 needs them for
 candidate selection), with ``use_fused_linear_ce=false``. This integration supports BSHD and packed THD batches with
 ``tp_size=pp_size=cp_size=1`` and does not directly load the published packed NVFP4 inference
 checkpoint into BF16 training modules.
+Target features are captured with SALM's original padding; before the draft forward,
+leading padding is moved to the end of each row so it cannot enter a draft context.
+
+``trainer.precision`` controls both target and draft dtypes during training;
+``dflash.target_dtype`` is only the fallback model configuration value. For BF16
+training, either the shipped ``bf16-flash`` or ``bf16-automodel`` trainer precision
+is supported. Target inference
+backend compatibility is validated before constructing the draft.
+
+``dflash.lr`` defaults to 6e-4 with AdamW and no scheduler. To reproduce an adaptation
+schedule, supply ``dflash.optimizer`` and ``dflash.lr_scheduler`` explicitly; for example:
+
+.. code-block:: yaml
+
+   dflash:
+     optimizer:
+       _target_: torch.optim.AdamW
+       lr: 1.5e-4
+       betas: [0.9, 0.999]
+       eps: 1e-8
+       weight_decay: 0.0
+     lr_scheduler:
+       _target_: nemo.core.optim.lr_scheduler.CosineAnnealing
+       warmup_steps: 500
+       min_lr: 1e-6
+       max_steps: 8000
+
+For a frozen target initialized from a Hugging Face directory after FSDP sharding,
+``model.init_from_checkpoint_strict=true`` (default) requires every model parameter
+in that checkpoint. Set it to ``false`` only for intentional partial initialization.
+This setting is separate from the public ``from_pretrained(strict=...)`` argument,
+which is honored by both local and distributed loading.
 
 To warm-start a draft, set ``dflash.init_from_pretrained`` to a local HuggingFace
 draft export matching the configured architecture. Loading rejects missing,

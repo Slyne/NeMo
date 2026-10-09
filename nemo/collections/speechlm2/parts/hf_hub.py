@@ -128,6 +128,7 @@ class HFHubMixin(
             torch_dtype=torch_dtype,
             distributed_setup=distributed_setup,
             cached_file_kwargs=_cached_file_kwargs,
+            strict=strict,
         )
 
     def save_pretrained(
@@ -190,6 +191,7 @@ def _distributed_from_pretrained(
     torch_dtype,
     distributed_setup,
     cached_file_kwargs,
+    strict: bool = False,
 ):
     """Create a distributed model instance outside of a classmethod frame.
 
@@ -215,7 +217,7 @@ def _distributed_from_pretrained(
     weight_file = cached_file(model_id, SAFETENSORS_SINGLE_FILE, **cached_file_kwargs)
     if weight_file is None:
         raise RuntimeError(f"Missing {SAFETENSORS_SINGLE_FILE} file for {model_id=}")
-    _load_state_dict_with_dtensors(instance, str(Path(weight_file).parent))
+    _load_state_dict_with_dtensors(instance, str(Path(weight_file).parent), strict=strict)
 
     return instance
 

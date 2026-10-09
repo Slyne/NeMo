@@ -353,6 +353,7 @@ class SALMDFlashModule(LightningModule):
             distributed_setup=distributed_setup,
             activation_checkpointing_perception=getattr(strategy, "activation_checkpointing_perception", False),
         )
+        self.target._validate_parallelism_compatibility(check_backward=False)
         self.target.eval()
         self.target.requires_grad_(False)
 
@@ -446,11 +447,7 @@ class SALMDFlashModule(LightningModule):
     def _audio_embeddings(self, batch: dict[str, torch.Tensor]) -> list[torch.Tensor]:
         spk_targets = batch.get("spk_targets")
         spk_target_lengths = batch.get("spk_target_length")
-        if self.target._uses_parallel_expert_encoder() and spk_targets is None:
-            embeddings, lengths = self.target.perception(
-                input_signal=batch["audios"], input_signal_length=batch["audio_lens"]
-            )
-            return [embedding[:length] for embedding, length in zip(embeddings, lengths)]
+        uses_parallel_expert_encoder = self.target._uses_parallel_expert_encoder()
 
         device_mesh = getattr(self.target, "_device_mesh", None)
         return encode_audio_with_cp_distribution(
@@ -461,8 +458,8 @@ class SALMDFlashModule(LightningModule):
             chunk_batch_size=self.target.cfg.get("encoder_chunk_batch_size"),
             sampling_rate=self.target.sampling_rate,
             cp_mesh=None,
-            spk_targets=spk_targets,
-            spk_target_lengths=spk_target_lengths,
+            spk_targets=spk_targets if uses_parallel_expert_encoder else None,
+            spk_target_lengths=spk_target_lengths if uses_parallel_expert_encoder else None,
             fsdp_sync_group=get_perception_fsdp_group(device_mesh),
         )
 
@@ -709,9 +706,25 @@ class SALMDFlashModule(LightningModule):
             inputs["seq_lens"].sum() if is_packed else inputs["attention_mask"].sum()
         ).detach()
         doc_remaining = inputs["doc_remaining"] if is_packed else None
+        draft_ids = inputs["input_ids"]
+        draft_loss_mask = inputs["loss_mask"]
+        draft_positions = None
+        if not is_packed:
+            # The draft prefix mask has no padding argument. Compute its
+            # right-padded layout before the synchronized anchor precheck;
+            # the target still receives the original left-padded inputs.
+            first_token = inputs["attention_mask"].long().argmax(dim=1)
+            if first_token.any():
+                positions = torch.arange(draft_ids.shape[1], device=first_token.device)
+                draft_positions = (positions.unsqueeze(0) + first_token.unsqueeze(1)) % positions.numel()
+                draft_ids = draft_ids.gather(1, draft_positions)
+                draft_loss_mask = draft_loss_mask.gather(1, draft_positions)
+        budget = self.dflash_config.get("max_total_anchors", 512)
+        if budget is not None and not _all_ranks_agree(draft_ids.shape[0] <= int(budget), draft_ids.device):
+            raise ValueError("dflash.max_total_anchors must cover the local batch size on every rank")
         if not _all_ranks_agree(
             _has_valid_dflash_anchors(
-                inputs["loss_mask"],
+                draft_loss_mask,
                 self.block_size,
                 doc_remaining=doc_remaining,
             ),
@@ -726,10 +739,16 @@ class SALMDFlashModule(LightningModule):
             hidden_states = target_outputs
             label_ids = None
         trainer_kwargs = {
-            "input_ids": inputs["input_ids"],
+            "input_ids": draft_ids,
             "hidden_states": hidden_states,
-            "loss_mask": inputs["loss_mask"],
+            "loss_mask": draft_loss_mask,
         }
+        if draft_positions is not None:
+            trainer_kwargs["hidden_states"] = hidden_states.gather(
+                1, draft_positions.unsqueeze(-1).expand_as(hidden_states)
+            )
+            if label_ids is not None:
+                label_ids = label_ids.gather(1, draft_positions)
         if label_ids is not None:
             trainer_kwargs["label_ids"] = label_ids
         if is_packed:
@@ -740,6 +759,9 @@ class SALMDFlashModule(LightningModule):
                     "doc_remaining": inputs["doc_remaining"],
                 }
             )
+        # Release the original feature buffer before the draft consumes its
+        # rotated copy; packed inputs still retain their buffer in trainer_kwargs.
+        del target_outputs, hidden_states
         return self.trainer_module(**trainer_kwargs)
 
     def _globally_normalized_loss(self, metrics) -> torch.Tensor:
@@ -757,14 +779,16 @@ class SALMDFlashModule(LightningModule):
 
         normalized_terms = []
         for loss, weight in loss_terms:
-            local_weight = weight.to(device=loss.device, dtype=loss.dtype)
+            local_weight = weight.to(device=loss.device, dtype=torch.float32)
             global_weight = local_weight.detach().clone()
             torch.distributed.all_reduce(
                 global_weight,
                 op=torch.distributed.ReduceOp.SUM,
                 group=self._draft_dp_group,
             )
-            normalized_terms.append(loss * local_weight * self._draft_dp_size / global_weight.clamp_min(1.0e-6))
+            normalized_terms.append(
+                loss.float() * local_weight * self._draft_dp_size / global_weight.clamp_min(1.0e-6)
+            )
         return sum(normalized_terms)
 
     def _loss_terms(self, metrics) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
@@ -999,12 +1023,13 @@ class SALMDFlashModule(LightningModule):
             raise ValueError("DFlash draft optimizer has no trainable parameters")
         optimizer_config = self.dflash_config.get("optimizer")
         if optimizer_config is None:
-            return torch.optim.AdamW(parameters, lr=self.learning_rate)
-        optimizer = safe_instantiate(
-            optimizer_config,
-            params=parameters,
-            _convert_="all",
-        )
+            optimizer = torch.optim.AdamW(parameters, lr=self.learning_rate)
+        else:
+            optimizer = safe_instantiate(
+                optimizer_config,
+                params=parameters,
+                _convert_="all",
+            )
         scheduler_config = self.dflash_config.get("lr_scheduler")
         if scheduler_config is None:
             return optimizer

@@ -10,6 +10,8 @@ model:
   # FSDP2/TP training), HuggingFace directories (model.safetensors), and
   # single-file .ckpt checkpoints. Set to null to train from pretrained_llm/asr.
   init_from_checkpoint: null
+  # DTensor HF target initialization requires all parameters by default.
+  # init_from_checkpoint_strict: true
 
   # Set to true to use SALMAutomodel (NeMo Automodel backend) instead of SALM (HF Transformers backend).
   use_nemo_automodel: true
@@ -394,6 +396,9 @@ dflash:
   selector_top_k: 16
   selector_loss_weight: 1.0
   use_fused_linear_ce: false  # SALM draft training uses dense logits.
-  target_dtype: bfloat16
-  lr: 6.0e-4
+  target_dtype: bfloat16  # Fallback only; trainer.precision controls the training dtype.
+  lr: 6.0e-4  # Default: AdamW, constant LR; no scheduler.
+  # Optional Hydra optimizer/lr_scheduler overrides; see the SpeechLM2 guide.
+  # optimizer: {_target_: torch.optim.AdamW, lr: 1.5e-4, weight_decay: 0.0}
+  # lr_scheduler: {_target_: nemo.core.optim.lr_scheduler.CosineAnnealing, warmup_steps: 500, min_lr: 1e-6, max_steps: 8000}
   output_dir: ./outputs/salm_dflash
