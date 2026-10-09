@@ -95,7 +95,7 @@ def test_synchronize_ep_group_is_noop_without_distributed_ep(monkeypatch):
 
     salm_dflash._synchronize_ep_group_before_target_forward(None)
     salm_dflash._synchronize_ep_group_before_target_forward(
-        _FakeMoEMesh(SimpleNamespace(size=lambda: 1, get_group=lambda: object()))
+        _FakeMoEMesh(SimpleNamespace(size=lambda: 1, get_group=object))
     )
 
     assert calls == []
@@ -186,7 +186,7 @@ class _BatchTarget(nn.Module):
 class _AudioTarget(_BatchTarget):
     def __init__(self):
         super().__init__()
-        self.cfg = {"encoder_chunk_size_seconds": 30.0, "encoder_chunk_batch_size": 8}
+        self.cfg.update({"encoder_chunk_size_seconds": 30.0, "encoder_chunk_batch_size": 8})
         self.perception = nn.Linear(1, 1)
         self.sampling_rate = 16000
         self._device_mesh = None
