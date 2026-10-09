@@ -269,6 +269,29 @@ def test_invalid_mtp_lk_config_fails_before_loading(monkeypatch, mtp_overrides, 
         SALMAutomodel.configure_model(model)
 
 
+def test_mtp_lk_rejects_fused_linear_cross_entropy_before_loading(monkeypatch):
+    model = _bare_model()
+    model.cfg = DictConfig(
+        {
+            "pretrained_llm": "unused",
+            "pretrained_asr": "unused",
+            "mtp": {"enabled": True, "training_mode": "head_only", "loss_type": "lk"},
+        }
+    )
+    model._trainer = None
+    model._use_fsdp = False
+    model._use_tp = False
+    model._fused_linear_cross_entropy = object()
+    monkeypatch.setattr(
+        salm_module,
+        "load_pretrained_automodel_llm",
+        lambda *_args, **_kwargs: pytest.fail("incompatible LK config must fail before loading"),
+    )
+
+    with pytest.raises(ValueError, match="cross_entropy_backend='eager'"):
+        SALMAutomodel.configure_model(model)
+
+
 def test_repeated_layer_settings_reach_native_mtp_constructor(monkeypatch):
     """Reload preserves logical MTP depth when the checkpoint stores one physical repeated layer."""
     from omegaconf import DictConfig
@@ -1270,7 +1293,6 @@ def test_training_step_routes_head_only_lk_to_backbone_teacher(monkeypatch):
     assert captured_kwargs["cu_seqlens"] is cu_seqlens
     assert captured_kwargs["lk_lambda"] == 0.4
     assert captured_kwargs["projection_sync_group"] is dp_group
-
 
 
 def test_mtp_validation_forward_uses_and_restores_native_gate():

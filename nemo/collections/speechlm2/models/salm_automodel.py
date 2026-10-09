@@ -648,6 +648,11 @@ class SALMAutomodel(LightningModule, HFHubMixin):
             packed_cu_seqlens = inputs.get("llm_kwargs", {}).get("cu_seqlens")
             mtp_loss_type = getattr(self, "_mtp_loss_type", "cross_entropy")
             if mtp_loss_type == "lk":
+                if logits is None:
+                    raise RuntimeError(
+                        "MTP LK loss requires materialized backbone teacher logits; "
+                        "set model.cross_entropy_backend='eager'."
+                    )
                 cp_group = self._device_mesh["cp"].get_group() if self._context_parallel_size > 1 else None
                 mtp_loss_output = calculate_mtp_lk_loss(
                     mtp_per_depth_targets=mtp_per_depth_targets,
@@ -682,6 +687,7 @@ class SALMAutomodel(LightningModule, HFHubMixin):
                         scaling_factor=self._mtp_loss_scaling_factor,
                         num_label_tokens=num_frames_global,
                         grad_reduce_group=dp_group,
+                        lm_weight=shared_lm_weight,
                         cu_seqlens=mtp_cu_seqlens,
                         return_per_depth=True,
                     )
@@ -1486,10 +1492,21 @@ class SALMAutomodel(LightningModule, HFHubMixin):
             )
         if mtp_loss_type == "lk" and mtp_training_mode != "head_only":
             raise ValueError("mtp.loss_type='lk' requires mtp.training_mode='head_only' so the teacher stays frozen")
+        if mtp_loss_type == "lk" and self._fused_linear_cross_entropy is not None:
+            raise ValueError(
+                "mtp.loss_type='lk' requires model.cross_entropy_backend='eager' so the frozen backbone "
+                "teacher logits are materialized."
+            )
         mtp_lk_lambda = float(mtp_cfg.get("lk_lambda", 0.5)) if mtp_requested else 0.5
         if mtp_loss_type == "lk" and not 0.0 <= mtp_lk_lambda <= 1.0:
             raise ValueError(f"mtp.lk_lambda must be in [0, 1], got {mtp_lk_lambda}")
         logging.info(f"MTP training mode={mtp_training_mode}, loss type={mtp_loss_type}")
+        if mtp_loss_type == "lk":
+            logging.info(
+                "MTP LK objective active: "
+                f"{mtp_lk_lambda:g} * KL(P_backbone || P_mtp) + "
+                f"{1.0 - mtp_lk_lambda:g} * TV(P_backbone, P_mtp)"
+            )
         if mtp_requested:
             # MTP supports both BSHD and packed THD. For THD the MTP loss must
             # receive cu_seqlens so target rolling is masked at packed sequence
