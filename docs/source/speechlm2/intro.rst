@@ -382,7 +382,7 @@ recipe, including its two-tap grouped dynamic convolution, top-16 rank-256 path 
 separately normalized backbone and selector losses. ``max_total_anchors`` bounds both variants'
 anchor allocation. Fused linear cross-entropy further bounds DFlash vocabulary-logit memory, but
 DFlash2 requires dense logits for candidate selection and therefore requires
-``use_fused_linear_ce=false``. This integration supports BSHD batches with
+``use_fused_linear_ce=false``. This integration supports BSHD and packed THD batches with
 ``tp_size=pp_size=cp_size=1`` and does not directly load the published packed NVFP4 inference
 checkpoint into BF16 training modules.
 
@@ -391,6 +391,47 @@ draft export matching the configured architecture. Loading rejects missing,
 unexpected, or mismatched weights. This initializes draft weights only; optimizer,
 scheduler, and step counters start fresh. The frozen target is still selected
 independently with the model's checkpoint settings.
+
+By default, ``dflash.label_source=ground_truth`` uses the reference tokens. Set
+``dflash.label_source=target_argmax`` to supervise the draft with the frozen
+backbone's greedy next-token predictions under the original, teacher-forced
+context. These are hard labels, not soft-logit distillation or generated
+rollouts. The input tokens and audio-conditioned hidden features remain the
+original context. Labels use the final-normalized state at the preceding token;
+packed document boundaries and padding never supply a predecessor. Only
+supervised positions are projected, in chunks bounded by
+``dflash.target_argmax_chunk_size`` (default 128), so full-sequence vocabulary
+logits are not retained. Draft features still use pre-final-normalization layer
+outputs. Validation uses the same configured label source.
+
+For projection-only adaptation of a pretrained DFlash2 draft, set
+``dflash.projection_only=true`` with ``dflash.init_from_pretrained``. Only the
+input feature projection ``fc.weight`` is trainable; the target, draft decoder,
+norms, convolutions, and candidate selector remain frozen. Gradients still flow
+through the frozen draft into the projection, including with activation
+checkpointing. The optimizer contains only trainable parameters, while draft
+checkpoints and Hugging Face exports retain all draft weights.
+
+For example, to adapt a compatible block8 DFlash2 export to block16:
+
+.. code-block:: yaml
+
+   dflash:
+     enabled: true
+     variant: dflash2
+     init_from_pretrained: /path/to/block8-draft
+     block_size: 16
+     label_source: target_argmax
+     target_argmax_chunk_size: 128
+     projection_only: true
+     use_fused_linear_ce: false
+
+Use this as an override to the existing SALM configuration, preserving the
+warm-start architecture and target-layer taps. The configured block size is
+used for training and saved in the exported draft config; strict loading still
+requires every weight shape to match. Set ``projection_only=false`` to train
+the full draft. A weights-only warm start can change block size; resuming a
+training checkpoint instead requires the same optimizer parameter selection.
 
 For more detailed information on training at scale, model parallelism, and SLURM-based training, see :doc:`training and scaling <training_and_scaling>`.
 

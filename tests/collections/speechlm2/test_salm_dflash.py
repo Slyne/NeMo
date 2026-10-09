@@ -1295,3 +1295,337 @@ def test_state_dict_hook_keeps_only_draft_parameters():
     salm_dflash.SALMDFlashModule._keep_draft_checkpoint_state(module, state_dict, "wrapper.", {})
 
     assert list(state_dict) == ["wrapper.draft_model.layer.weight"]
+
+
+def test_rejects_invalid_label_source_and_chunk_size():
+    with pytest.raises(ValueError, match="label_source"):
+        salm_dflash.SALMDFlashModule(nn.Linear(1, 1), {"dflash": {"mask_token_id": 18, "label_source": "teacher"}})
+    with pytest.raises(ValueError, match="target_argmax_chunk_size"):
+        salm_dflash.SALMDFlashModule(
+            nn.Linear(1, 1),
+            {"dflash": {"mask_token_id": 18, "target_argmax_chunk_size": 0}},
+        )
+
+
+def test_target_argmax_labels_are_causally_shifted_and_do_not_cross_packed_boundaries():
+    module = salm_dflash.SALMDFlashModule(
+        _TargetModel(),
+        {"dflash": {"mask_token_id": 18, "label_source": "target_argmax", "target_argmax_chunk_size": 2}},
+    )
+    weight = torch.eye(4)
+    module.trainer_module = SimpleNamespace(_materialize_frozen_lm_head=Mock(return_value=(weight, None)))
+    inputs = {
+        "input_ids": torch.tensor([[10, 11, 20, 21]]),
+        "position_ids": torch.tensor([[0, 1, 0, 1]]),
+        "loss_mask": torch.ones(1, 4, dtype=torch.bool),
+        "qkv_format": "thd",
+    }
+
+    labels = module._build_target_argmax_labels(torch.eye(4), inputs)
+
+    assert labels.tolist() == [[10, 0, 20, 2]]
+    assert module.trainer_module._materialize_frozen_lm_head.call_count == 1
+
+
+def test_target_argmax_hidden_capture_uses_final_norm_and_skips_full_logits():
+    module = salm_dflash.SALMDFlashModule(
+        _TargetModel(),
+        {"dflash": {"mask_token_id": 18, "label_source": "target_argmax", "target_argmax_chunk_size": 2}},
+    )
+    module.target_layer_ids = [0, 2]
+    module.trainer_module = SimpleNamespace(_materialize_frozen_lm_head=Mock(return_value=(torch.eye(4), None)))
+    inputs = {
+        "input_ids": torch.tensor([[7, 8, 9]]),
+        "input_embeddings": torch.tensor([[[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]]]),
+        "attention_mask": torch.ones(1, 3, dtype=torch.bool),
+        "loss_mask": torch.ones(1, 3, dtype=torch.bool),
+    }
+
+    hidden, labels = module._target_hidden_states(inputs)
+
+    assert hidden.shape == (1, 3, 8)
+    # Final norm adds ten after the layer stack adds six, so every row's
+    # dominant class is derived from the final-normalized representation.
+    expected_top1 = (inputs["input_embeddings"] + 16).argmax(dim=-1)
+    assert labels.tolist() == [[7, expected_top1[0, 0].item(), expected_top1[0, 1].item()]]
+    assert module.target.llm.calls[-1]["compute_logits"] is False
+
+
+def test_run_batch_forwards_target_argmax_labels(monkeypatch):
+    module = salm_dflash.SALMDFlashModule(
+        _BatchTarget(),
+        {"dflash": {"mask_token_id": 990, "block_size": 2, "label_source": "target_argmax"}},
+    )
+    prepared = {
+        "input_ids": torch.tensor([[10, 11, 12]]),
+        "input_embeddings": torch.randn(1, 3, 4),
+        "attention_mask": torch.ones(1, 3, dtype=torch.bool),
+        "loss_mask": torch.tensor([[False, True, True]]),
+    }
+    label_ids = torch.tensor([[10, 20, 21]])
+    monkeypatch.setattr(module, "_prepare_batch", Mock(return_value=prepared))
+    monkeypatch.setattr(
+        module,
+        "_target_hidden_states",
+        Mock(return_value=(torch.randn(1, 3, 8), label_ids)),
+    )
+    monkeypatch.setattr(salm_dflash, "_has_valid_dflash_anchors", lambda *args, **kwargs: True)
+    module.trainer_module = _CaptureDFlashTrainer()
+    module._trainer = SimpleNamespace(strategy=SimpleNamespace(moe_mesh=None))
+
+    module._run_batch({})
+
+    assert module.trainer_module.kwargs["label_ids"] is label_ids
+
+
+@pytest.mark.parametrize("variant,init_path", [("dflash", "draft"), ("dflash2", None)])
+def test_projection_only_requires_pretrained_dflash2(variant, init_path):
+    with pytest.raises(ValueError, match="projection_only"):
+        salm_dflash.SALMDFlashModule(
+            _TrainerTarget(),
+            {
+                "dflash": {
+                    "mask_token_id": 63,
+                    "variant": variant,
+                    "projection_only": True,
+                    "init_from_pretrained": init_path,
+                }
+            },
+        )
+
+
+@pytest.mark.parametrize("block_size", [8, 16])
+@pytest.mark.parametrize("activation_checkpointing", [False, True])
+def test_projection_only_warm_start_updates_only_fc_and_resumes(tmp_path, block_size, activation_checkpointing):
+    torch.manual_seed(7)
+    target = _TrainerTarget().requires_grad_(False)
+    cfg = {
+        "variant": "dflash2",
+        "mask_token_id": 63,
+        "block_size": block_size,
+        "draft_num_hidden_layers": 2,
+        "target_layer_ids": [1, 4],
+        "conv_group_size": 8,
+        "selector_rank": 16,
+        "selector_top_k": 8,
+        "num_anchors": 2,
+        "max_total_anchors": 2,
+        "attention_backend": "sdpa",
+        "projection_only": True,
+        "init_from_pretrained": str(tmp_path / "warm"),
+        "use_fused_linear_ce": False,
+    }
+    warm_config, _ = salm_dflash._build_draft_config(target.llm.config, cfg, 8, 63)
+    warm_config._attn_implementation = "sdpa"
+    initial = Qwen3DFlash2DraftModel(warm_config)
+    initial.save_pretrained(tmp_path / "warm")
+    initial_state = {name: value.clone() for name, value in initial.state_dict().items()}
+    target_state = {name: value.clone() for name, value in target.state_dict().items()}
+
+    def build_module():
+        module = salm_dflash.SALMDFlashModule(target, {"dflash": cfg})
+        config, module.target_layer_ids = salm_dflash._build_draft_config(target.llm.config, cfg, block_size, 63)
+        config._attn_implementation = "sdpa"
+        module.draft_model = module._initialize_draft_model(config, torch.float32)
+        module._configure_projection_only()
+        if activation_checkpointing:
+            module.draft_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        module.trainer_module = module._create_trainer_module()
+        return module
+
+    module = build_module()
+    optimizer = module.configure_optimizers()
+    assert module.draft_model.config.block_size == block_size
+    assert {n for n, p in module.draft_model.named_parameters() if p.requires_grad} == {"fc.weight"}
+    assert [p for g in optimizer.param_groups for p in g["params"]] == [module.draft_model.fc.weight]
+    input_ids = torch.randint(0, 63, (1, 32))
+    features = torch.randn(1, 32, 64)
+    labels = (input_ids + 1) % 63
+
+    def step(model, opt):
+        opt.zero_grad(set_to_none=True)
+        torch.manual_seed(42)
+        metrics = model.trainer_module(
+            input_ids=input_ids, hidden_states=features, loss_mask=torch.ones(1, 32), label_ids=labels
+        )
+        metrics.loss.backward()
+        assert torch.isfinite(model.draft_model.fc.weight.grad).all()
+        assert model.draft_model.fc.weight.grad.abs().sum() > 0
+        assert all(p.grad is None for n, p in model.draft_model.named_parameters() if n != "fc.weight")
+        opt.step()
+
+    step(module, optimizer)
+    assert not torch.equal(module.draft_model.fc.weight, initial_state["fc.weight"])
+    for name, value in module.draft_model.state_dict().items():
+        if name != "fc.weight":
+            torch.testing.assert_close(value, initial_state[name], rtol=0, atol=0)
+    for name, value in target.state_dict().items():
+        torch.testing.assert_close(value, target_state[name], rtol=0, atol=0)
+    assert all(p.grad is None for p in target.parameters())
+    module.draft_model.save_pretrained(tmp_path / "export")
+    exported = Qwen3DFlash2DraftModel.from_pretrained(tmp_path / "export")
+    assert exported.config.block_size == block_size
+    for name, value in module.draft_model.state_dict().items():
+        torch.testing.assert_close(exported.state_dict()[name], value, rtol=0, atol=0)
+
+    import copy
+
+    model_state = copy.deepcopy(module.state_dict())
+    optimizer_state = copy.deepcopy(optimizer.state_dict())
+    resumed = build_module()
+    resumed.load_state_dict(model_state)
+    resumed_optimizer = resumed.configure_optimizers()
+    resumed_optimizer.load_state_dict(optimizer_state)
+    step(module, optimizer)
+    step(resumed, resumed_optimizer)
+    for name, value in module.draft_model.state_dict().items():
+        torch.testing.assert_close(resumed.draft_model.state_dict()[name], value, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("chunk_size", [1, 2, 8])
+def test_target_argmax_matches_dense_logits_with_padding_and_mask(chunk_size):
+    torch.manual_seed(19)
+    module = salm_dflash.SALMDFlashModule(
+        _TargetModel(), {"dflash": {"mask_token_id": 18, "target_argmax_chunk_size": chunk_size}}
+    )
+    weight, bias = torch.randn(7, 4), torch.randn(7)
+    module.trainer_module = SimpleNamespace(_materialize_frozen_lm_head=Mock(return_value=(weight, bias)))
+    hidden = torch.randn(2, 5, 4)
+    ids = torch.tensor([[0, 0, 4, 3, 2], [1, 2, 3, 4, 5]])
+    mask = torch.tensor([[0, 0, 1, 1, 1], [1, 1, 1, 1, 0]], dtype=torch.bool)
+    loss_mask = torch.tensor([[0, 0, 1, 1, 1], [0, 1, 0, 1, 0]], dtype=torch.bool)
+    inputs = {"input_ids": ids, "attention_mask": mask, "loss_mask": loss_mask}
+    labels = module._build_target_argmax_labels(hidden, inputs)
+    dense = torch.nn.functional.linear(hidden, weight, bias).argmax(-1)
+    expected = ids.clone()
+    expected[0, 3:] = dense[0, 2:4]
+    expected[1, 1] = dense[1, 0]
+    expected[1, 3] = dense[1, 2]
+    torch.testing.assert_close(labels, expected)
+    torch.testing.assert_close(inputs["input_ids"], ids)
+
+
+def test_target_argmax_final_norm_changes_label_and_cleans_hooks_on_error():
+    target = _TargetModel()
+    target.llm.norm = nn.Linear(4, 4, bias=False)
+    with torch.no_grad():
+        target.llm.norm.weight.copy_(torch.eye(4).flip(0))
+    module = salm_dflash.SALMDFlashModule(target, {"dflash": {"mask_token_id": 18, "label_source": "target_argmax"}})
+    module.target_layer_ids = [0, 2]
+    module.trainer_module = SimpleNamespace(_materialize_frozen_lm_head=Mock(return_value=(torch.eye(4), None)))
+    inputs = {
+        "input_ids": torch.tensor([[7, 8, 9]]),
+        "input_embeddings": torch.eye(4)[:3].unsqueeze(0),
+        "attention_mask": torch.ones(1, 3, dtype=torch.bool),
+        "loss_mask": torch.ones(1, 3, dtype=torch.bool),
+    }
+    hidden, labels = module._target_hidden_states(inputs)
+    assert labels.tolist() == [[7, 3, 2]]
+    torch.testing.assert_close(hidden[..., :4], inputs["input_embeddings"] + 1)
+    assert not any(m._forward_hooks for m in target.llm.modules())
+    module.trainer_module._materialize_frozen_lm_head.side_effect = RuntimeError("head unavailable")
+    with pytest.raises(RuntimeError, match="head unavailable"):
+        module._target_hidden_states(inputs)
+    assert not any(m._forward_hooks for m in target.llm.modules())
+
+
+def _projection_only_fsdp_worker(rank, rendezvous, dtype):
+    import copy
+    from datetime import timedelta
+
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import fully_shard
+
+    torch.set_num_threads(1)
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    dist.init_process_group("nccl", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=60))
+    try:
+        torch.manual_seed(7)
+        target = _TrainerTarget().to(device=device, dtype=dtype).requires_grad_(False)
+        cfg = {
+            "variant": "dflash2",
+            "mask_token_id": 63,
+            "block_size": 16,
+            "draft_num_hidden_layers": 2,
+            "target_layer_ids": [1, 4],
+            "conv_group_size": 8,
+            "selector_rank": 16,
+            "selector_top_k": 8,
+            "num_anchors": 2,
+            "max_total_anchors": 2,
+            "attention_backend": "sdpa",
+            "projection_only": True,
+            "init_from_pretrained": "already-loaded",
+        }
+        module = salm_dflash.SALMDFlashModule(target, {"dflash": cfg})
+        config, _ = salm_dflash._build_draft_config(target.llm.config, cfg, 16, 63)
+        config._attn_implementation = "sdpa"
+        module.draft_model = Qwen3DFlash2DraftModel(config).to(device=device, dtype=dtype)
+        module._configure_projection_only()
+        module.trainer_module = module._create_trainer_module().to(device)
+        reference = copy.deepcopy(module)
+        ref_optimizer = reference.configure_optimizers()
+        initial = {name: value.clone() for name, value in reference.draft_model.state_dict().items()}
+        mesh = init_device_mesh("cuda", (2,), mesh_dim_names=("dp",))
+        fully_shard(module.draft_model, mesh=mesh)
+        optimizer = module.configure_optimizers()
+        # Test real sharded target-head gathering with no successor labels on rank 0.
+        fully_shard(target.llm, mesh=mesh)
+        ids = torch.tensor([[1, 2, 3, 4]], device=device)
+        hidden = torch.randn(1, 4, 32, device=device, dtype=dtype)
+        inputs = {
+            "input_ids": ids,
+            "attention_mask": torch.ones_like(ids, dtype=torch.bool),
+            "loss_mask": torch.full_like(ids, rank, dtype=torch.bool),
+        }
+        labels = module._build_target_argmax_labels(hidden, inputs)
+        expected = ids.clone()
+        if rank:
+            expected[:, 1:] = reference.target.llm.lm_head(hidden[:, :-1]).argmax(-1)
+        torch.testing.assert_close(labels, expected)
+        # Compare sharded gradients/updates with the average of two unsharded references.
+        # Use the reference frozen target here to isolate draft FSDP from target execution.
+        object.__setattr__(module.trainer_module, "lm_head", reference.target.llm.lm_head)
+        object.__setattr__(module.trainer_module, "embed_tokens", reference.target.llm.embed_tokens)
+        torch.manual_seed(100 + rank)
+        ids = torch.randint(0, 63, (1, 32), device=device)
+        features = torch.randn(1, 32, 64, device=device, dtype=dtype)
+        for model in (reference, module):
+            torch.manual_seed(300 + rank)
+            result = model.trainer_module(
+                input_ids=ids, hidden_states=features, loss_mask=torch.ones_like(ids), label_ids=(ids + 1) % 63
+            )
+            result.loss.backward()
+        dist.all_reduce(reference.draft_model.fc.weight.grad)
+        reference.draft_model.fc.weight.grad.div_(2)
+        grad = module.draft_model.fc.weight.grad.full_tensor()
+        torch.testing.assert_close(
+            grad,
+            reference.draft_model.fc.weight.grad,
+            rtol=2e-2 if dtype == torch.bfloat16 else 2e-4,
+            atol=5e-4 if dtype == torch.bfloat16 else 2e-6,
+        )
+        optimizer.step()
+        ref_optimizer.step()
+        for name, parameter in module.draft_model.named_parameters():
+            expected = reference.draft_model.state_dict()[name] if name == "fc.weight" else initial[name]
+            torch.testing.assert_close(
+                parameter.full_tensor(),
+                expected,
+                rtol=2e-4 if name == "fc.weight" else 0,
+                atol=2e-6 if name == "fc.weight" else 0,
+            )
+        assert all(p.grad is None for p in target.parameters())
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.run_only_on("GPU")
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
+def test_projection_only_fsdp_and_empty_rank_argmax(tmp_path, dtype):
+    torch.multiprocessing.spawn(
+        _projection_only_fsdp_worker, args=(f"file://{tmp_path / 'rendezvous'}", dtype), nprocs=2
+    )

@@ -350,7 +350,7 @@ exp_manager:
 # inference artifact and cannot directly initialize these trainable BF16
 # nn.Linear weights; these settings reproduce its architecture, not its weights.
 #
-# This integration supports DFlash and DFlash2 with BSHD batches and
+# This integration supports DFlash and DFlash2 with BSHD or packed THD batches and
 # tp_size=pp_size=cp_size=1. The DFlash2 defaults mirror Automodel's recipe: a
 # two-tap grouped dynamic convolution and a rank-256 top-16 path selector. DFlash2
 # needs dense draft logits for that selector, so fused linear CE is only available
@@ -359,6 +359,9 @@ dflash:
   enabled: false
   init_from_pretrained: null  # Local HF draft export; weights only, fresh optimizer/scheduler.
   variant: dflash2  # dflash or dflash2
+  label_source: ground_truth  # ground_truth or target_argmax (frozen target's next-token top-1).
+  target_argmax_chunk_size: 128  # Supervised positions per target vocabulary projection.
+  projection_only: false  # DFlash2 warm start: train only fc.weight; requires init_from_pretrained.
   mask_token_id: 990
   draft_num_hidden_layers: 6
   target_layer_ids: [1, 5, 19, 29, 41, 51]

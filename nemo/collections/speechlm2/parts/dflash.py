@@ -22,6 +22,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from lightning import LightningModule
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh, get_fsdp_dp_mesh
 from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule, NoValidAnchorsError
@@ -284,6 +285,14 @@ class SALMDFlashModule(LightningModule):
         self.attention_backend = str(self.dflash_config.get("attention_backend", "flex_attention"))
         self.output_dir = self.dflash_config.get("output_dir")
         self.learning_rate = float(self.dflash_config.get("lr", 6e-4))
+        self.label_source = str(self.dflash_config.get("label_source", "ground_truth")).lower()
+        if self.label_source not in {"ground_truth", "target_argmax"}:
+            raise ValueError(
+                "dflash.label_source must be 'ground_truth' or 'target_argmax', " f"got {self.label_source!r}"
+            )
+        self.target_argmax_chunk_size = int(self.dflash_config.get("target_argmax_chunk_size", 128))
+        if self.target_argmax_chunk_size <= 0:
+            raise ValueError("dflash.target_argmax_chunk_size must be > 0, " f"got {self.target_argmax_chunk_size}")
         self.selector_loss_weight = float(self.dflash_config.get("selector_loss_weight", 1.0))
         if self.selector_loss_weight < 0:
             raise ValueError(f"dflash.selector_loss_weight must be >= 0, got {self.selector_loss_weight}")
@@ -296,6 +305,10 @@ class SALMDFlashModule(LightningModule):
                     "dflash.use_fused_linear_ce is not supported by DFlash2 because its path selector needs "
                     "the draft logits; set it to false"
                 )
+        if self.dflash_config.get("projection_only", False) and (
+            self.dflash_variant != "dflash2" or not self.dflash_config.get("init_from_pretrained")
+        ):
+            raise ValueError("dflash.projection_only requires variant='dflash2' and init_from_pretrained")
         self.draft_model = None
         self.trainer_module = None
         self.target_layer_ids = None
@@ -356,6 +369,7 @@ class SALMDFlashModule(LightningModule):
         draft_config._attn_implementation = self.attention_backend
         dtype = next(self.target.llm.parameters()).dtype
         self.draft_model = self._initialize_draft_model(draft_config, dtype).to(self.target.device, dtype=dtype)
+        self._configure_projection_only()
         if self.dflash_config.get("activation_checkpointing", True):
             self.draft_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
@@ -501,8 +515,69 @@ class SALMDFlashModule(LightningModule):
             "loss_mask": target_ids.ne(-100),
         }
 
+    def _target_final_norm(self) -> nn.Module:
+        """Return the target decoder's model-level final normalization module."""
+        candidates = (
+            getattr(getattr(self.target.llm, "model", None), "norm", None),
+            getattr(self.target.llm, "norm", None),
+            getattr(getattr(self.target.llm, "transformer", None), "ln_f", None),
+        )
+        for candidate in candidates:
+            if isinstance(candidate, nn.Module):
+                return candidate
+        raise ValueError(
+            "dflash.label_source='target_argmax' requires a discoverable final decoder norm "
+            "at llm.model.norm, llm.norm, or llm.transformer.ln_f"
+        )
+
     @torch.no_grad()
-    def _target_hidden_states(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+    def _build_target_argmax_labels(self, final_hidden: torch.Tensor, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Build one-step target-model labels without materializing full-sequence logits."""
+        input_ids = inputs["input_ids"]
+        if final_hidden.ndim == 2:
+            final_hidden = final_hidden.unsqueeze(0)
+        if final_hidden.ndim != 3 or final_hidden.shape[:2] != input_ids.shape:
+            raise RuntimeError(
+                "Target final hidden states must align with input_ids; "
+                f"got {tuple(final_hidden.shape)} and {tuple(input_ids.shape)}"
+            )
+
+        # Every rank must enter the head's DTensor gather, including ranks with
+        # no supervised successors. Chunking below performs no collectives.
+        weight, bias = self.trainer_module._materialize_frozen_lm_head(final_hidden.device)
+        labels = input_ids.clone()
+        if input_ids.shape[1] <= 1:
+            return labels
+        if inputs.get("qkv_format") == "thd":
+            # position_ids resets to zero at each packed-document boundary.
+            same_sequence = inputs["position_ids"][:, 1:] > 0
+        else:
+            attention_mask = inputs["attention_mask"].bool()
+            same_sequence = attention_mask[:, :-1] & attention_mask[:, 1:]
+
+        # Only supervised labels can enter DFlash's loss. Project their causal
+        # predecessor states instead of every audio/prompt/answer position in a
+        # potentially 65k-token sequence. This is numerically identical on every
+        # loss-bearing position while avoiding a prohibitively large vocabulary
+        # projection over unsupervised audio embeddings.
+        selected_targets = inputs["loss_mask"][:, 1:].bool() & same_sequence
+        selected_rows, selected_columns_minus_one = selected_targets.nonzero(as_tuple=True)
+        if selected_rows.numel() == 0:
+            return labels
+        selected_columns = selected_columns_minus_one + 1
+        selected_hidden = final_hidden[selected_rows, selected_columns - 1]
+
+        selected_top1 = torch.empty(selected_hidden.shape[0], dtype=input_ids.dtype, device=input_ids.device)
+        for start in range(0, selected_hidden.shape[0], self.target_argmax_chunk_size):
+            end = min(start + self.target_argmax_chunk_size, selected_hidden.shape[0])
+            selected_top1[start:end] = F.linear(selected_hidden[start:end], weight, bias).argmax(dim=-1)
+        labels[selected_rows, selected_columns] = selected_top1
+        return labels
+
+    @torch.no_grad()
+    def _target_hidden_states(
+        self, inputs: dict[str, torch.Tensor]
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run the frozen target and concatenate pre-final-norm decoder-block outputs.
 
         Args:
@@ -515,7 +590,9 @@ class SALMDFlashModule(LightningModule):
             Tensor of shape ``[batch, sequence, selected_layers * hidden]``.
             THD hook outputs are normalized to one synthetic packed batch row.
             Each feature is the raw output of the configured decoder block,
-            before any separate model-level final normalization.
+            before any separate model-level final normalization. With
+            ``label_source=target_argmax``, also return token-aligned labels
+            computed from the post-final-norm states of causal predecessors.
         """
         packing_fields = ("qkv_format", "cu_seqlens", "position_ids", "seq_lens", "doc_remaining", "max_seqlen")
         is_packed = any(name in inputs for name in packing_fields)
@@ -534,8 +611,10 @@ class SALMDFlashModule(LightningModule):
         else:
             layers = list(layer_container)
 
+        final_norm = self._target_final_norm() if self.label_source == "target_argmax" else None
         captured = {}
         handles = []
+        final_hidden = []
 
         def make_hook(layer_id: int):
             def hook(_module, _args, output):
@@ -545,6 +624,12 @@ class SALMDFlashModule(LightningModule):
 
         for layer_id in self.target_layer_ids:
             handles.append(layers[layer_id].register_forward_hook(make_hook(layer_id)))
+        if final_norm is not None:
+
+            def final_norm_hook(_module, _args, output):
+                final_hidden.append(output[0] if isinstance(output, tuple) else output)
+
+            handles.append(final_norm.register_forward_hook(final_norm_hook))
 
         forward_kwargs = {
             "inputs_embeds": inputs["input_embeddings"],
@@ -579,6 +664,8 @@ class SALMDFlashModule(LightningModule):
                 handle.remove()
         if len(captured) != len(self.target_layer_ids):
             raise RuntimeError(f"Expected {len(self.target_layer_ids)} captured target layers, got {sorted(captured)}")
+        if self.label_source == "target_argmax" and len(final_hidden) != 1:
+            raise RuntimeError(f"Expected one captured target final-norm output, got {len(final_hidden)}")
         hidden_states = torch.cat([captured[layer_id] for layer_id in self.target_layer_ids], dim=-1)
         if is_packed:
             if hidden_states.ndim == 2:
@@ -593,6 +680,8 @@ class SALMDFlashModule(LightningModule):
                     "Packed DFlash target features are not token aligned: "
                     f"got {hidden_states.shape[1]} features for {expected_tokens} input IDs"
                 )
+        if self.label_source == "target_argmax":
+            return hidden_states, self._build_target_argmax_labels(final_hidden[0], inputs)
         return hidden_states
 
     def _run_batch(self, batch: dict[str, torch.Tensor]):
@@ -617,12 +706,19 @@ class SALMDFlashModule(LightningModule):
         ):
             raise NoValidAnchorsError("At least one rank has no valid DFlash anchors")
         _synchronize_ep_group_before_target_forward(getattr(self.trainer.strategy, "moe_mesh", None))
-        hidden_states = self._target_hidden_states(inputs)
+        target_outputs = self._target_hidden_states(inputs)
+        if self.label_source == "target_argmax":
+            hidden_states, label_ids = target_outputs
+        else:
+            hidden_states = target_outputs
+            label_ids = None
         trainer_kwargs = {
             "input_ids": inputs["input_ids"],
             "hidden_states": hidden_states,
             "loss_mask": inputs["loss_mask"],
         }
+        if label_ids is not None:
+            trainer_kwargs["label_ids"] = label_ids
         if is_packed:
             trainer_kwargs.update(
                 {
@@ -869,13 +965,31 @@ class SALMDFlashModule(LightningModule):
             # changing non-DFlash logging or requiring a DFlash-only exp_manager.
             self.log("val_acc", accuracy, on_epoch=True)
 
+    def _configure_projection_only(self) -> None:
+        """Freeze the warm-started draft except its target-feature projection.
+
+        Apply before FSDP wrapping and optimizer construction. Frozen decoder
+        layers retain autograd so the loss still differentiates through them
+        into ``fc.weight``.
+        """
+        if not self.dflash_config.get("projection_only", False):
+            return
+        self.draft_model.requires_grad_(False)
+        self.draft_model.fc.requires_grad_(True)
+        logging.info(
+            f"DFlash2 projection-only training: {self.draft_model.fc.weight.numel()} trainable parameters (fc.weight)"
+        )
+
     def configure_optimizers(self):
+        parameters = [parameter for parameter in self.draft_model.parameters() if parameter.requires_grad]
+        if not parameters:
+            raise ValueError("DFlash draft optimizer has no trainable parameters")
         optimizer_config = self.dflash_config.get("optimizer")
         if optimizer_config is None:
-            return torch.optim.AdamW(self.draft_model.parameters(), lr=self.learning_rate)
+            return torch.optim.AdamW(parameters, lr=self.learning_rate)
         optimizer = safe_instantiate(
             optimizer_config,
-            params=self.draft_model.parameters(),
+            params=parameters,
             _convert_="all",
         )
         scheduler_config = self.dflash_config.get("lr_scheduler")
