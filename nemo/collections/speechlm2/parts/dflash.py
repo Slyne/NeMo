@@ -695,14 +695,6 @@ class SALMDFlashModule(LightningModule):
     def _run_batch(self, batch: dict[str, torch.Tensor]):
         inputs = self._prepare_batch(batch)
         is_packed = inputs.get("qkv_format") == "thd"
-        # Keep the expanded, non-padding target-input count next to the result
-        # without changing Automodel's public metric dataclasses. The training
-        # loop consumes it immediately after _run_batch returns. For THD this is
-        # the sum of document lengths; for padded BSHD the attention mask is the
-        # equivalent count after audio-frame expansion.
-        self._last_input_token_count = (
-            inputs["seq_lens"].sum() if is_packed else inputs["attention_mask"].sum()
-        ).detach()
         doc_remaining = inputs["doc_remaining"] if is_packed else None
         draft_ids = inputs["input_ids"]
         draft_loss_mask = inputs["loss_mask"]
@@ -798,10 +790,6 @@ class SALMDFlashModule(LightningModule):
     def training_step(self, batch, batch_idx):
         batches = list(batch.values()) if isinstance(batch, dict) and "input_ids" not in batch else [batch]
         losses = []
-        input_token_counts = []
-        valid_token_counts = []
-        valid_block_counts = []
-        loss_weights = []
         skip_counts = defaultdict(int)
         num_batches = _max_rank_value(len(batches), self.device)
         for dataset_index in range(num_batches):
@@ -822,10 +810,6 @@ class SALMDFlashModule(LightningModule):
                 skip_counts["no_valid_anchors"] += 1
                 continue
             losses.append(self._globally_normalized_loss(metrics))
-            input_token_counts.append(self._last_input_token_count)
-            valid_token_counts.append(metrics.valid_tokens.detach())
-            valid_block_counts.append(metrics.valid_blocks.detach())
-            loss_weights.append(metrics.loss_weight.detach())
             self.log("train/dflash_loss", metrics.loss, on_step=True, prog_bar=True)
             self.log("train/dflash_accuracy", metrics.accuracy, on_step=True)
             self.log("train/accept_len", metrics.accept_len, on_step=True)
@@ -845,43 +829,8 @@ class SALMDFlashModule(LightningModule):
             for reason, count in skip_counts.items():
                 self.log(f"train/dflash_skip/{reason}", float(count), on_step=True)
             return torch.zeros((), device=self.device, requires_grad=True)
-        additive_metrics = {
-            "train/dflash_input_tokens": input_token_counts,
-            "train/dflash_valid_tokens": valid_token_counts,
-            "train/dflash_valid_blocks": valid_block_counts,
-            "train/dflash_loss_weight": loss_weights,
-        }
-        distributed_log_kwargs = {}
-        if self._draft_dp_size > 1:
-            distributed_log_kwargs = {
-                "sync_dist": True,
-                "sync_dist_group": self._draft_dp_group,
-                "reduce_fx": "sum",
-            }
-        for name, values in additive_metrics.items():
-            local_total = torch.stack([value.to(device=self.device, dtype=torch.float64) for value in values]).sum()
-            self.log(name, local_total, on_step=True, **distributed_log_kwargs)
         self.log("train/dflash_skipped_step", 0.0, on_step=True)
         return torch.stack(losses).mean()
-
-    def on_train_batch_end(self, outputs, batch, batch_idx) -> None:
-        """Persist post-backward peak HBM for production capacity checks."""
-        if not torch.cuda.is_available():
-            return
-        distributed_log_kwargs = {}
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            distributed_log_kwargs = {"sync_dist": True, "reduce_fx": "max"}
-        memory_metrics = {
-            "train/dflash_peak_memory_allocated_bytes": torch.cuda.max_memory_allocated(),
-            "train/dflash_peak_memory_reserved_bytes": torch.cuda.max_memory_reserved(),
-        }
-        for name, value in memory_metrics.items():
-            self.log(
-                name,
-                torch.tensor(value, device=self.device, dtype=torch.float64),
-                on_step=True,
-                **distributed_log_kwargs,
-            )
 
     def on_validation_epoch_start(self) -> None:
         self._partial_val_metrics.clear()

@@ -99,7 +99,6 @@ def train(cfg):
         from nemo.collections.speechlm2.parts.dflash import SALMDFlashModule
 
         model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
-        model_cfg["torch_dtype"] = cfg.dflash.get("target_dtype", "bfloat16")
         with trainer.init_module():
             target_model = SALMAutomodel(model_cfg)
         model = SALMDFlashModule(target_model, OmegaConf.to_container(cfg, resolve=True))

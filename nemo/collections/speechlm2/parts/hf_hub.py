@@ -128,7 +128,6 @@ class HFHubMixin(
             torch_dtype=torch_dtype,
             distributed_setup=distributed_setup,
             cached_file_kwargs=_cached_file_kwargs,
-            strict=strict,
         )
 
     def save_pretrained(
@@ -191,7 +190,6 @@ def _distributed_from_pretrained(
     torch_dtype,
     distributed_setup,
     cached_file_kwargs,
-    strict: bool = False,
 ):
     """Create a distributed model instance outside of a classmethod frame.
 
@@ -217,7 +215,7 @@ def _distributed_from_pretrained(
     weight_file = cached_file(model_id, SAFETENSORS_SINGLE_FILE, **cached_file_kwargs)
     if weight_file is None:
         raise RuntimeError(f"Missing {SAFETENSORS_SINGLE_FILE} file for {model_id=}")
-    _load_state_dict_with_dtensors(instance, str(Path(weight_file).parent), strict=strict)
+    _load_state_dict_with_dtensors(instance, str(Path(weight_file).parent))
 
     return instance
 
@@ -243,7 +241,7 @@ def _canonicalize_named_tensors(named_tensors, kind: str):
     return result
 
 
-def _load_state_dict_with_dtensors(model, weight_dir, *, strict: bool = True):
+def _load_state_dict_with_dtensors(model, weight_dir, *, strict: bool = False):
     """Load safetensors weights into a model with DTensor parameters using DCP.
 
     Uses ``torch.distributed.checkpoint`` with ``_HuggingFaceStorageReader``

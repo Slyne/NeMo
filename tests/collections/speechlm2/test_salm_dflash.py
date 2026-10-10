@@ -398,7 +398,6 @@ def test_run_batch_forwards_all_packing_metadata(monkeypatch, variant):
     assert module.trainer_module.kwargs["position_ids"] is packed["position_ids"]
     assert module.trainer_module.kwargs["seq_lens"] is packed["seq_lens"]
     assert module.trainer_module.kwargs["doc_remaining"] is packed["doc_remaining"]
-    assert module._last_input_token_count.item() == 4
 
 
 def test_packed_anchor_precheck_requires_complete_block_in_document():
@@ -1097,7 +1096,6 @@ def test_training_step_synchronizes_multi_dataset_skips(monkeypatch):
         valid_tokens=torch.tensor(12),
         valid_blocks=torch.tensor(4),
     )
-    module._last_input_token_count = torch.tensor(21)
     run_batch = Mock(side_effect=[salm_dflash.NoValidAnchorsError("skip"), metrics])
     monkeypatch.setattr(module, "_run_batch", run_batch)
     batch = {
@@ -1110,72 +1108,6 @@ def test_training_step_synchronizes_multi_dataset_skips(monkeypatch):
     torch.testing.assert_close(loss, metrics.loss)
     assert availability == [True, True, False]
     assert run_batch.call_count == 2
-    log.assert_any_call("train/dflash_input_tokens", torch.tensor(21.0, dtype=torch.float64), on_step=True)
-    log.assert_any_call("train/dflash_valid_tokens", torch.tensor(12.0, dtype=torch.float64), on_step=True)
-    log.assert_any_call("train/dflash_valid_blocks", torch.tensor(4.0, dtype=torch.float64), on_step=True)
-    log.assert_any_call("train/dflash_loss_weight", torch.tensor(3.0, dtype=torch.float64), on_step=True)
-
-
-def test_training_telemetry_sums_over_draft_dp_group(monkeypatch):
-    module = salm_dflash.SALMDFlashModule(nn.Linear(1, 1), {"dflash": {"mask_token_id": 18}})
-    module.draft_model = nn.Linear(1, 1)
-    module._draft_dp_size = 2
-    module._draft_dp_group = object()
-    module._last_input_token_count = torch.tensor(21)
-    log = Mock()
-    monkeypatch.setattr(module, "log", log)
-    monkeypatch.setattr(salm_dflash, "_max_rank_value", lambda value, _device: value)
-    monkeypatch.setattr(salm_dflash, "_all_ranks_agree", lambda condition, _device: condition)
-    monkeypatch.setattr(salm_dflash, "_all_ranks_report_same_value", lambda _value, _device: True)
-    metrics = SimpleNamespace(
-        loss=torch.tensor(2.0, requires_grad=True),
-        loss_weight=torch.tensor(3.0),
-        accuracy=torch.tensor(0.5),
-        accept_len=torch.tensor(1.5),
-        valid_tokens=torch.tensor(12),
-        valid_blocks=torch.tensor(4),
-    )
-    monkeypatch.setattr(module, "_run_batch", Mock(return_value=metrics))
-    monkeypatch.setattr(module, "_globally_normalized_loss", lambda result: result.loss)
-
-    module.training_step({"input_ids": torch.ones(1, 2, dtype=torch.long)}, batch_idx=0)
-
-    log.assert_any_call(
-        "train/dflash_input_tokens",
-        torch.tensor(21.0, dtype=torch.float64),
-        on_step=True,
-        sync_dist=True,
-        sync_dist_group=module._draft_dp_group,
-        reduce_fx="sum",
-    )
-
-
-def test_training_peak_memory_telemetry_uses_max_rank_value(monkeypatch):
-    module = salm_dflash.SALMDFlashModule(nn.Linear(1, 1), {"dflash": {"mask_token_id": 18}})
-    log = Mock()
-    monkeypatch.setattr(module, "log", log)
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda: 123)
-    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda: 456)
-    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
-    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
-
-    module.on_train_batch_end(outputs=None, batch=None, batch_idx=0)
-
-    log.assert_any_call(
-        "train/dflash_peak_memory_allocated_bytes",
-        torch.tensor(123.0, dtype=torch.float64),
-        on_step=True,
-        sync_dist=True,
-        reduce_fx="max",
-    )
-    log.assert_any_call(
-        "train/dflash_peak_memory_reserved_bytes",
-        torch.tensor(456.0, dtype=torch.float64),
-        on_step=True,
-        sync_dist=True,
-        reduce_fx="max",
-    )
 
 
 @pytest.mark.parametrize("configured", [Path("outputs/draft"), Path("/durable/draft")])

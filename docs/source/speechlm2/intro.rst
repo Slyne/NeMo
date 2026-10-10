@@ -390,11 +390,9 @@ checkpoint into BF16 training modules.
 Target features are captured with SALM's original padding; before the draft forward,
 leading padding is moved to the end of each row so it cannot enter a draft context.
 
-``trainer.precision`` controls both target and draft dtypes during training;
-``dflash.target_dtype`` is only the fallback model configuration value. For BF16
+``trainer.precision`` controls both target and draft dtypes during training. For BF16
 training, either the shipped ``bf16-flash`` or ``bf16-automodel`` trainer precision
-is supported. Target inference
-backend compatibility is validated before constructing the draft.
+is supported. Target inference backend compatibility is validated before constructing the draft.
 
 ``dflash.lr`` defaults to 6e-4 with AdamW and no scheduler. To reproduce an adaptation
 schedule, supply ``dflash.optimizer`` and ``dflash.lr_scheduler`` explicitly; for example:
@@ -417,8 +415,6 @@ schedule, supply ``dflash.optimizer`` and ``dflash.lr_scheduler`` explicitly; fo
 For a frozen target initialized from a Hugging Face directory after FSDP sharding,
 ``model.init_from_checkpoint_strict=true`` (default) requires every model parameter
 in that checkpoint. Set it to ``false`` only for intentional partial initialization.
-This setting is separate from the public ``from_pretrained(strict=...)`` argument,
-which is honored by both local and distributed loading.
 
 To warm-start a draft, set ``dflash.init_from_pretrained`` to a local HuggingFace
 draft export matching the configured architecture. Loading rejects missing,

@@ -259,7 +259,6 @@ def pack_audio_for_dflash(
         "max_seqlen": torch.tensor(max(document_lengths), dtype=torch.int32, device=device),
         "qkv_format": "thd",
     }
-    _validate_packed_dflash_inputs(packed)
     return packed
 
 

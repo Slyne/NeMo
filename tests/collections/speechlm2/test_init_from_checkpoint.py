@@ -246,6 +246,28 @@ def test_wrapper_aware_distributed_hf_loader_copies_checkpoint_value(tmp_path):
     torch.testing.assert_close(model.model._checkpoint_wrapped_module.weight, expected)
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize("strict", [False, True])
+def test_distributed_hf_loader_requires_complete_parameters_only_when_strict(tmp_path, strict):
+    model = SimpleModel()
+    original = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
+    expected = torch.full_like(model.linear.weight, 7.0)
+    save_file({"linear.weight": expected}, str(tmp_path / "model.safetensors"))
+
+    if strict:
+        with pytest.raises(RuntimeError, match="Refusing to partially initialize"):
+            _load_state_dict_with_dtensors(model, str(tmp_path), strict=True)
+        for name, parameter in model.named_parameters():
+            torch.testing.assert_close(parameter, original[name])
+    else:
+        # The existing distributed from_pretrained path keeps its permissive default.
+        _load_state_dict_with_dtensors(model, str(tmp_path))
+        torch.testing.assert_close(model.linear.weight, expected)
+        for name, parameter in model.named_parameters():
+            if name != "linear.weight":
+                torch.testing.assert_close(parameter, original[name])
+
+
 # ---------------------------------------------------------------------------
 # init_from_training_checkpoint — DCP path (mocked)
 # ---------------------------------------------------------------------------

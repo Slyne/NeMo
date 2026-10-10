@@ -396,7 +396,6 @@ dflash:
   selector_top_k: 16
   selector_loss_weight: 1.0
   use_fused_linear_ce: false  # SALM draft training uses dense logits.
-  target_dtype: bfloat16  # Fallback only; trainer.precision controls the training dtype.
   lr: 6.0e-4  # Default: AdamW, constant LR; no scheduler.
   # Optional Hydra optimizer/lr_scheduler overrides; see the SpeechLM2 guide.
   # optimizer: {_target_: torch.optim.AdamW, lr: 1.5e-4, weight_decay: 0.0}
