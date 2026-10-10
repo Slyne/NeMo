@@ -63,42 +63,137 @@ def test_anchor_precheck_matches_automodel_unpacked_sampler(loss_mask, block_siz
     assert salm_dflash._has_valid_dflash_anchors(loss_mask, block_size) is automodel_has_valid
 
 
-class _FakeMoEMesh:
-    mesh_dim_names = ("ep_shard", "ep")
+def test_stateful_training_resume_does_not_skip_a_batch():
+    from lightning.pytorch.loops.utilities import _select_data_fetcher
+    from lightning.pytorch.trainer.states import RunningStage
+    from lightning.pytorch.utilities.combined_loader import CombinedLoader
 
-    def __init__(self, ep_mesh):
-        self.ep_mesh = ep_mesh
+    class StatefulCursor:
+        def __init__(self, position=0):
+            self.position = position
 
-    def __getitem__(self, name):
-        assert name == "ep"
-        return self.ep_mesh
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            batch = self.position
+            self.position += 1
+            return batch
+
+    def setup(position=0):
+        cursor = StatefulCursor(position)
+        trainer = SimpleNamespace(lightning_module=salm_dflash.SALMDFlashModule)
+        fetcher = _select_data_fetcher(trainer, RunningStage.TRAINING)
+        fetcher.setup(CombinedLoader(cursor, "max_size_cycle"))
+        iter(fetcher)
+        return cursor, fetcher
+
+    def next_batch(fetcher):
+        batch = next(fetcher)
+        if hasattr(batch, "__next__"):
+            batch = next(batch)
+        return batch[0]
+
+    cursor, continuous = setup()
+    assert next_batch(continuous) == 0
+    saved_position = cursor.position
+    expected_next = next_batch(continuous)
+    _, resumed = setup(saved_position)
+
+    assert next_batch(resumed) == expected_next == 1
 
 
-def test_synchronize_ep_group_uses_ep_process_group(monkeypatch):
-    group = object()
-    ep_mesh = SimpleNamespace(size=lambda: 8, get_group=lambda: group)
-    calls = []
-    monkeypatch.setattr(salm_dflash.torch.distributed, "is_available", lambda: True)
-    monkeypatch.setattr(salm_dflash.torch.distributed, "is_initialized", lambda: True)
-    monkeypatch.setattr(salm_dflash.torch.distributed, "barrier", lambda *, group: calls.append(group))
+def test_training_step_transfers_iterator_batch_before_forward(monkeypatch):
+    from nemo.core.utils import lightning_utils
 
-    salm_dflash._synchronize_ep_group_before_target_forward(_FakeMoEMesh(ep_mesh))
+    module = salm_dflash.SALMDFlashModule(nn.Linear(1, 1), {"dflash": {"mask_token_id": 18}})
+    events = []
 
-    assert calls == [group]
+    def transform(name):
+        def apply(batch, **kwargs):
+            events.append((name, batch, kwargs))
+            return batch + 1
 
+        return apply
 
-def test_synchronize_ep_group_is_noop_without_distributed_ep(monkeypatch):
-    calls = []
-    monkeypatch.setattr(salm_dflash.torch.distributed, "is_available", lambda: True)
-    monkeypatch.setattr(salm_dflash.torch.distributed, "is_initialized", lambda: True)
-    monkeypatch.setattr(salm_dflash.torch.distributed, "barrier", lambda **kwargs: calls.append(kwargs))
-
-    salm_dflash._synchronize_ep_group_before_target_forward(None)
-    salm_dflash._synchronize_ep_group_before_target_forward(
-        _FakeMoEMesh(SimpleNamespace(size=lambda: 1, get_group=object))
+    monkeypatch.setattr(lightning_utils, "_check_shutdown_before_next_batch", lambda _: events.append("shutdown"))
+    module._trainer = SimpleNamespace(
+        precision_plugin=SimpleNamespace(convert_input=transform("precision")),
+        strategy=SimpleNamespace(batch_to_device=transform("device")),
     )
+    monkeypatch.setattr(module, "_on_before_batch_transfer", transform("before_transfer"))
+    forward = Mock(return_value="loss")
+    monkeypatch.setattr(module, "_training_step_batch", forward, raising=False)
 
-    assert calls == []
+    def batches():
+        events.append("fetch")
+        yield 10, 7, 2
+
+    assert module.training_step(iter(batches())) == "loss"
+    assert events == [
+        "shutdown",
+        "fetch",
+        ("precision", 10, {}),
+        ("before_transfer", 11, {"dataloader_idx": 2}),
+        ("device", 12, {"dataloader_idx": 2}),
+    ]
+    forward.assert_called_once_with(13, 7)
+
+
+@pytest.mark.parametrize("variant", ["dflash", "dflash2"])
+@pytest.mark.parametrize("skip_batch", [False, True])
+def test_iterator_training_runs_with_lightning_logging(monkeypatch, tmp_path, skip_batch, variant):
+    from lightning.pytorch import Trainer
+    from torch.utils.data import DataLoader
+
+    from nemo.utils.callbacks.training_stats import TrainingStatsCallback
+
+    module = salm_dflash.SALMDFlashModule(nn.Linear(1, 1), {"dflash": {"mask_token_id": 18, "variant": variant}})
+    module.draft_model = nn.Linear(1, 1)
+    module._draft_dp_size = 1
+    module._draft_dp_group = None
+    monkeypatch.setattr(module, "configure_model", lambda: None)
+    monkeypatch.setattr(module, "on_train_end", lambda: None)
+
+    def run_batch(batch):
+        if skip_batch:
+            raise salm_dflash.NoValidAnchorsError("skip")
+        loss = module.draft_model(torch.ones(1, 1)).sum()
+        return SimpleNamespace(
+            loss=loss,
+            loss_weight=torch.tensor(1.0),
+            accuracy=torch.tensor(0.5),
+            accept_len=torch.tensor(1.5),
+            base_loss=loss,
+            selector_loss=loss * 0.1,
+            selector_loss_denominator=torch.tensor(1.0),
+            base_accuracy=torch.tensor(0.5),
+            base_accept_len=torch.tensor(1.5),
+            candidate_recall=torch.tensor(0.75),
+        )
+
+    monkeypatch.setattr(module, "_run_batch", run_batch)
+    stats = TrainingStatsCallback()
+    trainer = Trainer(
+        callbacks=[stats],
+        accelerator="cpu",
+        devices=1,
+        max_steps=2,
+        logger=False,
+        enable_checkpointing=False,
+        enable_progress_bar=False,
+        enable_model_summary=False,
+        num_sanity_val_steps=0,
+        default_root_dir=tmp_path,
+    )
+    trainer.fit(module, train_dataloaders=DataLoader([{"input_ids": torch.ones(2, dtype=torch.long)}] * 2))
+
+    assert trainer.global_step == 2
+    assert stats.num_examples_total == 2
+    assert stats.num_tokens_total == 4
+    assert trainer.logged_metrics["train/dflash_skipped_step"].item() == float(skip_batch)
+    if not skip_batch:
+        assert "train/dflash_loss" in trainer.logged_metrics
 
 
 @pytest.mark.parametrize("axis", ["tp_size", "cp_size"])
@@ -139,6 +234,18 @@ def test_expand_ids_with_audio_left_pads_rows_to_common_length():
     )
 
     assert expanded.tolist() == [[10, 18, 18, 12], [20, 21, 22, 23]]
+
+
+def test_expand_ids_with_audio_handles_adjacent_and_edge_placeholders():
+    expanded = salm_dflash._expand_ids_with_audio(
+        torch.tensor([[0, 99, 99, 11, 99], [12, 13, 99, 14, 15]]),
+        [torch.randn(length, 4) for length in (2, 1, 3, 2)],
+        padding_id=0,
+        placeholder_id=99,
+        mask_token_id=18,
+    )
+
+    assert expanded.tolist() == [[18, 18, 18, 11, 18, 18, 18], [0, 12, 13, 18, 18, 14, 15]]
 
 
 def test_expand_ids_with_audio_requires_every_replacement_to_be_used():
@@ -1103,7 +1210,7 @@ def test_training_step_synchronizes_multi_dataset_skips(monkeypatch):
         "dataset_b": {"input_ids": torch.ones(1, 2, dtype=torch.long)},
     }
 
-    loss = module.training_step(batch, batch_idx=0)
+    loss = module._training_step_batch(batch, batch_idx=0)
 
     torch.testing.assert_close(loss, metrics.loss)
     assert availability == [True, True, False]
@@ -1143,14 +1250,14 @@ def test_training_step_returns_differentiable_zero_when_every_dataset_is_skipped
         Mock(side_effect=salm_dflash.NoValidAnchorsError("skip")),
     )
 
-    loss = module.training_step({"input_ids": torch.ones(1, 2, dtype=torch.long)}, batch_idx=0)
+    loss = module._training_step_batch({"input_ids": torch.ones(1, 2, dtype=torch.long)}, batch_idx=0)
 
     assert loss.item() == 0.0
     assert loss.requires_grad
     loss.backward()
     assert all(parameter.grad is None for parameter in module.draft_model.parameters())
-    log.assert_any_call("train/dflash_skipped_step", 1.0, on_step=True)
-    log.assert_any_call("train/dflash_skip/no_valid_anchors", 1.0, on_step=True)
+    log.assert_any_call("train/dflash_skipped_step", 1.0, on_step=True, batch_size=1)
+    log.assert_any_call("train/dflash_skip/no_valid_anchors", 1.0, on_step=True, batch_size=1)
 
 
 def test_validation_step_accumulates_additive_metrics_in_float64(monkeypatch):

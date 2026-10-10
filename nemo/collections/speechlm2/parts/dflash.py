@@ -37,6 +37,7 @@ from nemo.collections.speechlm2.models.salm import replace_placeholders_and_buil
 from nemo.collections.speechlm2.parts.cp_helpers import encode_audio_with_cp_distribution, get_perception_fsdp_group
 from nemo.collections.speechlm2.parts.packed_sequences import _validate_packed_dflash_inputs, pack_audio_for_dflash
 from nemo.core.classes.common import safe_instantiate
+from nemo.core.utils.lightning_utils import read_batch
 from nemo.utils import logging
 
 _DRAFT_CONFIG_MANAGED_KEYS = {
@@ -87,17 +88,6 @@ def _preprocessing_signature(batch: dict[str, torch.Tensor]) -> int:
     has_audio = audio_lens is not None and audio_lens.numel() > 0
     has_speaker_targets = batch.get("spk_targets") is not None
     return int(has_audio) | (int(has_speaker_targets) << 1)
-
-
-def _synchronize_ep_group_before_target_forward(moe_mesh) -> None:
-    """Keep rank-local audio preprocessing skew out of DeepEP's timeout."""
-    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
-        return
-    if moe_mesh is None or "ep" not in moe_mesh.mesh_dim_names:
-        return
-    ep_mesh = moe_mesh["ep"]
-    if ep_mesh.size() > 1:
-        torch.distributed.barrier(group=ep_mesh.get_group())
 
 
 def _has_valid_dflash_anchors(
@@ -235,14 +225,15 @@ def _expand_ids_with_audio(
         first_non_padding = int(non_padding[0]) if non_padding.numel() else row.numel() - 1
         row = row[first_non_padding:]
         pieces = []
-        for token in row:
-            if int(token) == placeholder_id:
-                length = replacements[replacement_idx].shape[0]
-                replacement_idx += 1
-                pieces.append(torch.full((length,), mask_token_id, dtype=row.dtype, device=row.device))
-            else:
-                pieces.append(token.view(1))
-        rows.append(torch.cat(pieces) if pieces else row)
+        start = 0
+        for position in (row == placeholder_id).nonzero(as_tuple=True)[0].tolist():
+            pieces.append(row[start:position])
+            length = replacements[replacement_idx].shape[0]
+            replacement_idx += 1
+            pieces.append(torch.full((length,), mask_token_id, dtype=row.dtype, device=row.device))
+            start = position + 1
+        pieces.append(row[start:])
+        rows.append(torch.cat(pieces))
     if replacement_idx != len(replacements):
         raise ValueError(f"Used {replacement_idx} of {len(replacements)} audio replacements")
 
@@ -272,7 +263,6 @@ class SALMDFlashModule(LightningModule):
     def __init__(self, target_model: nn.Module, cfg: dict):
         super().__init__()
         self.target = target_model
-        self.cfg = cfg
         self.dflash_config = cfg.get("dflash", cfg)
         self.dflash_variant = str(self.dflash_config.get("variant", "dflash")).lower()
         if self.dflash_variant not in _DFLASH_VARIANTS:
@@ -382,9 +372,6 @@ class SALMDFlashModule(LightningModule):
             from torch.distributed.fsdp import fully_shard
 
             self.draft_model = fully_shard(self.draft_model, mesh=draft_fsdp_mesh)
-
-        if any(parameter.requires_grad for parameter in self.target.parameters()):
-            raise RuntimeError("The DFlash SALM target must be fully frozen")
 
     def _create_trainer_module(self) -> DFlashTrainerModule:
         """Build the Automodel trainer matching the configured draft variant."""
@@ -718,7 +705,6 @@ class SALMDFlashModule(LightningModule):
             inputs["loss_mask"].device,
         ):
             raise NoValidAnchorsError("At least one rank has no valid DFlash anchors")
-        _synchronize_ep_group_before_target_forward(getattr(self.trainer.strategy, "moe_mesh", None))
         target_outputs = self._target_hidden_states(inputs)
         if self.label_source == "target_argmax":
             hidden_states, label_ids = target_outputs
@@ -787,7 +773,13 @@ class SALMDFlashModule(LightningModule):
             )
         return ((metrics.loss, metrics.loss_weight),)
 
-    def training_step(self, batch, batch_idx):
+    def training_step(self, dataloader_iter):
+        batch, batch_idx = read_batch(dataloader_iter, self)
+        return self._training_step_batch(batch, batch_idx)
+
+    def _training_step_batch(self, batch, batch_idx):
+        # Iterator-mode Lightning requires an explicit batch size for logging.
+        # These are step-only metrics; batch_size=1 does not weight the objective.
         batches = list(batch.values()) if isinstance(batch, dict) and "input_ids" not in batch else [batch]
         losses = []
         skip_counts = defaultdict(int)
@@ -810,26 +802,26 @@ class SALMDFlashModule(LightningModule):
                 skip_counts["no_valid_anchors"] += 1
                 continue
             losses.append(self._globally_normalized_loss(metrics))
-            self.log("train/dflash_loss", metrics.loss, on_step=True, prog_bar=True)
-            self.log("train/dflash_accuracy", metrics.accuracy, on_step=True)
-            self.log("train/accept_len", metrics.accept_len, on_step=True)
+            self.log("train/dflash_loss", metrics.loss, on_step=True, prog_bar=True, batch_size=1)
+            self.log("train/dflash_accuracy", metrics.accuracy, on_step=True, batch_size=1)
+            self.log("train/accept_len", metrics.accept_len, on_step=True, batch_size=1)
             if self.dflash_variant == "dflash2":
-                self.log("train/dflash_base_loss", metrics.base_loss, on_step=True)
-                self.log("train/dflash_selector_loss", metrics.selector_loss, on_step=True)
-                self.log("train/dflash_base_accuracy", metrics.base_accuracy, on_step=True)
-                self.log("train/dflash_base_accept_len", metrics.base_accept_len, on_step=True)
-                self.log("train/dflash_candidate_recall", metrics.candidate_recall, on_step=True)
+                self.log("train/dflash_base_loss", metrics.base_loss, on_step=True, batch_size=1)
+                self.log("train/dflash_selector_loss", metrics.selector_loss, on_step=True, batch_size=1)
+                self.log("train/dflash_base_accuracy", metrics.base_accuracy, on_step=True, batch_size=1)
+                self.log("train/dflash_base_accept_len", metrics.base_accept_len, on_step=True, batch_size=1)
+                self.log("train/dflash_candidate_recall", metrics.candidate_recall, on_step=True, batch_size=1)
         if not losses:
             # Every rank takes the same synchronized skip branches above. Lightning
             # rejects ``None`` from ``training_step`` under distributed automatic
             # optimization, so return a standalone differentiable zero. It has no
             # graph edge to optimizer-owned draft parameters: backward is valid, all
             # draft gradients stay ``None``, and AdamW performs no parameter update.
-            self.log("train/dflash_skipped_step", 1.0, on_step=True)
+            self.log("train/dflash_skipped_step", 1.0, on_step=True, batch_size=1)
             for reason, count in skip_counts.items():
-                self.log(f"train/dflash_skip/{reason}", float(count), on_step=True)
+                self.log(f"train/dflash_skip/{reason}", float(count), on_step=True, batch_size=1)
             return torch.zeros((), device=self.device, requires_grad=True)
-        self.log("train/dflash_skipped_step", 0.0, on_step=True)
+        self.log("train/dflash_skipped_step", 0.0, on_step=True, batch_size=1)
         return torch.stack(losses).mean()
 
     def on_validation_epoch_start(self) -> None:
