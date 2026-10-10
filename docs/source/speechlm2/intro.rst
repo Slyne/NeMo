@@ -379,9 +379,12 @@ choose ``dflash.variant`` (``dflash`` or ``dflash2``), and provide a reserved
 ``dflash.mask_token_id``; ``salm_train.py`` then trains and exports draft-only weights while
 preserving SALM's audio-placeholder expansion. The shipped DFlash2 settings mirror Automodel's
 recipe, including its two-tap grouped dynamic convolution, top-16 rank-256 path selector, and
-separately normalized backbone and selector losses. ``max_total_anchors`` bounds both variants'
-anchor allocation. Both variants use dense draft logits (DFlash2 needs them for
-candidate selection), with ``use_fused_linear_ce=false``. This integration supports BSHD and packed THD batches with
+separately normalized backbone and selector losses. ``num_anchors`` limits sampled blocks per row;
+packed THD batches use one row per rank. For non-packed BSHD batches, up to
+``batch_size * num_anchors`` blocks are allocated per rank; reduce ``num_anchors`` when using larger batches.
+Packed-document boundaries are enforced by document-local anchor selection, attention masks, and position IDs.
+Both variants use dense draft logits (DFlash2 needs them for candidate selection), with
+``use_fused_linear_ce=false``. This integration supports BSHD and packed THD batches with
 ``tp_size=pp_size=cp_size=1`` and does not directly load the published packed NVFP4 inference
 checkpoint into BF16 training modules.
 Target features are captured with SALM's original padding; before the draft forward,

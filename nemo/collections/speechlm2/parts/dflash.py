@@ -388,7 +388,6 @@ class SALMDFlashModule(LightningModule):
 
     def _create_trainer_module(self) -> DFlashTrainerModule:
         """Build the Automodel trainer matching the configured draft variant."""
-        max_total_anchors = self.dflash_config.get("max_total_anchors", 512)
         common_trainer_kwargs = {
             "draft_model": self.draft_model,
             "target_lm_head": self.target.llm.get_output_embeddings(),
@@ -397,7 +396,6 @@ class SALMDFlashModule(LightningModule):
             "block_size": self.block_size,
             "attention_backend": self.attention_backend,
             "num_anchors": int(self.dflash_config.get("num_anchors", 512)),
-            "max_total_anchors": int(max_total_anchors) if max_total_anchors is not None else None,
             "loss_decay_gamma": self.dflash_config.get("loss_decay_gamma", 4.0),
             "sliding_window": self.dflash_config.get("draft_sliding_window"),
         }
@@ -719,9 +717,6 @@ class SALMDFlashModule(LightningModule):
                 draft_positions = (positions.unsqueeze(0) + first_token.unsqueeze(1)) % positions.numel()
                 draft_ids = draft_ids.gather(1, draft_positions)
                 draft_loss_mask = draft_loss_mask.gather(1, draft_positions)
-        budget = self.dflash_config.get("max_total_anchors", 512)
-        if budget is not None and not _all_ranks_agree(draft_ids.shape[0] <= int(budget), draft_ids.device):
-            raise ValueError("dflash.max_total_anchors must cover the local batch size on every rank")
         if not _all_ranks_agree(
             _has_valid_dflash_anchors(
                 draft_loss_mask,

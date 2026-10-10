@@ -383,8 +383,8 @@ dflash:
       rope_type: yarn
     use_cache: false
   block_size: 8
+  # Per row; packed THD uses one row, while BSHD allocation grows with batch size.
   num_anchors: 512
-  max_total_anchors: 512
   loss_decay_gamma: 4.0
   draft_sliding_window: null
   attention_backend: flex_attention

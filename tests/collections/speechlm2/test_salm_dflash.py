@@ -47,7 +47,7 @@ REPO_ROOT = Path(__file__).parents[3]
 )
 def test_anchor_precheck_matches_automodel_unpacked_sampler(loss_mask, block_size):
     """The synchronized precheck must exactly predict Automodel's early raise."""
-    trainer = SimpleNamespace(block_size=block_size, num_anchors=512, max_total_anchors=None)
+    trainer = SimpleNamespace(block_size=block_size, num_anchors=512)
     try:
         salm_dflash.DFlashTrainerModule._sample_anchor_positions(
             trainer,
@@ -545,7 +545,6 @@ def test_create_trainer_module_selects_configured_variant(monkeypatch, variant, 
             "dflash": {
                 "variant": variant,
                 "mask_token_id": 18,
-                "max_total_anchors": 64,
                 "selector_loss_weight": 0.25,
                 "use_fused_linear_ce": False,
             }
@@ -563,7 +562,6 @@ def test_create_trainer_module_selects_configured_variant(monkeypatch, variant, 
     unselected.assert_not_called()
     kwargs = selected.call_args.kwargs
     assert kwargs["draft_model"] is module.draft_model
-    assert kwargs["max_total_anchors"] == 64
     if variant == "dflash2":
         assert kwargs["selector_loss_weight"] == pytest.approx(0.25)
         assert "use_fused_linear_ce" not in kwargs
@@ -622,7 +620,6 @@ def test_dflash2_salm_components_run_forward_and_train_selector():
         "selector_rank": 16,
         "selector_top_k": 64,
         "num_anchors": 2,
-        "max_total_anchors": 2,
         "attention_backend": "sdpa",
         "activation_checkpointing": False,
     }
@@ -683,7 +680,6 @@ def test_salm_automodel_dflash2_defaults_match_nemotron_3_5_lightning():
     assert dflash_cfg["variant"] == "dflash2"
     assert dflash_cfg["block_size"] == 8
     assert dflash_cfg["num_anchors"] == 512
-    assert dflash_cfg["max_total_anchors"] == 512
     assert dflash_cfg["loss_decay_gamma"] == pytest.approx(4.0)
     assert dflash_cfg["attention_backend"] == "flex_attention"
     assert dflash_cfg["activation_checkpointing"] is True
@@ -1413,7 +1409,6 @@ def test_projection_only_warm_start_updates_only_fc_and_resumes(tmp_path, block_
         "selector_rank": 16,
         "selector_top_k": 8,
         "num_anchors": 2,
-        "max_total_anchors": 2,
         "attention_backend": "sdpa",
         "projection_only": True,
         "init_from_pretrained": str(tmp_path / "warm"),
@@ -1558,7 +1553,6 @@ def _projection_only_fsdp_worker(rank, rendezvous, dtype, separate_target_units)
             "selector_rank": 16,
             "selector_top_k": 8,
             "num_anchors": 2,
-            "max_total_anchors": 2,
             "attention_backend": "sdpa",
             "projection_only": True,
             "init_from_pretrained": "already-loaded",
@@ -1734,26 +1728,6 @@ def test_padded_anchor_precheck_uses_the_draft_layout(monkeypatch):
     assert salm_dflash._has_valid_dflash_anchors(module.trainer_module.kwargs["loss_mask"], 4)
 
 
-@pytest.mark.parametrize("local_batch", [1, 3])
-def test_anchor_budget_rejected_on_all_ranks_before_target(monkeypatch, local_batch):
-    module = salm_dflash.SALMDFlashModule(
-        _BatchTarget(), {"dflash": {"mask_token_id": 18, "block_size": 2, "max_total_anchors": 2}}
-    )
-    ids = torch.ones(local_batch, 4, dtype=torch.long)
-    monkeypatch.setattr(
-        module,
-        "_prepare_batch",
-        lambda batch: {"input_ids": ids, "loss_mask": ids.bool(), "attention_mask": ids.bool()},
-    )
-    target_forward = Mock()
-    monkeypatch.setattr(module, "_target_hidden_states", target_forward)
-    # The peer's batch exceeds the budget, even on the locally valid rank.
-    monkeypatch.setattr(salm_dflash, "_all_ranks_agree", lambda condition, device: False)
-    with pytest.raises(ValueError, match="every rank"):
-        module._run_batch({})
-    target_forward.assert_not_called()
-
-
 def test_scheduler_can_use_default_optimizer():
     module = salm_dflash.SALMDFlashModule(
         nn.Linear(1, 1),
@@ -1793,7 +1767,6 @@ def test_batched_draft_loss_is_invariant_to_padding_features(monkeypatch, label_
         "selector_rank": 16,
         "selector_top_k": 8,
         "num_anchors": 2,
-        "max_total_anchors": 4,
         "attention_backend": "sdpa",
         "label_source": label_source,
     }
